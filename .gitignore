@@ -1,0 +1,31 @@
+# Dependencias
+node_modules/
+package-lock.json.bak
+
+# Compilación (se genera en CI y en local al compilar)
+dist/
+
+# Logs y temporales
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.system_generated/
+scratch/
+
+# Entornos y secretos
+.env
+.env.local
+*.bak
+GEMINI.md
+*BRIEFING*
+*.prompt
+prompts/
+
+# Sistema operativo y editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+

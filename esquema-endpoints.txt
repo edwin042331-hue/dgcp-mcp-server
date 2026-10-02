@@ -1,0 +1,113 @@
+﻿
+=== /procesos ===
+totalResults: 630766 | pages: 630766
+  codigo_proceso                     String   = AYUNTAMIENTO STGO-DAF-CM-2026-0099
+  codigo_unidad_compra               Int32    = 731
+  unidad_compra                      String   = Ayuntamiento Santiago de los Caballeros
+  modalidad                          String   = ContrataciÃ³n Menor
+  tipo_excepcion                     String   = Proceso ordinario
+  titulo                             String   = CONTRATACIÃN DE SERVICIOS DE CATERING A REQUERIMIENTO DEL DEPARTAMENT...
+  descripcion                        String   = CONTRATACIÃN DE SERVICIOS DE CATERING A REQUERIMIENTO DEL DEPARTAMENT...
+  estado_proceso                     String   = Proceso publicado
+  divisa                             String   = DOP
+  monto_estimado                     Int32    = 1800000
+  fecha_publicacion                  String   = 2026-09-21T18:00:03.43Z
+  fecha_enmienda                     String   = 2026-09-25T18:00:00Z
+  fecha_fin_recepcion_ofertas        String   = 2026-09-28T18:00:00Z
+  fecha_apertura_ofertas             String   = 2026-09-29T09:00:00Z
+  fecha_estimada_adjudicacion        String   = 2026-10-05T11:00:00Z
+  fecha_suscripcion                  String   = 2026-10-05T15:00:00Z
+  fecha_habilitacion_oferente        String   = 2026-10-05T18:00:00Z
+  dirigido_mipymes                   String   = No
+  dirigido_mipymes_mujeres           String   = No
+  proceso_lotificado                 String   = No
+  es_snip                            String   = No
+  codigo_snip                        String   = N/A
+  numero_proveedores_notificados     String   = 13866
+  area_requiriente                   String   = DEPTO  DE PROTOCOLO 
+  url                                String   = https://comunidad.comprasdominicana.gob.do//Public/Tendering/Opportuni...
+  adquisicion_planeada               String   = Si
+  justificacion_no_pacc              String   = Adquisicion planeada
+  objeto_proceso                     String   = Servicios
+  subobjeto_proceso                  String   = Servicios comunes y estandarizados
+  decreto_presidencial               String   = No
+  resolucion_maxima_autoridad        String   = No
+  organismo_financiero_externo       String   = No
+  marco_decreto_3122                 String   = No
+  compra_verde                       String   = No
+  compra_conjunta                    String   = No
+  duracion_contrato                  String   = 1dias
+
+=== /contratos ===
+totalResults: 722003 | pages: 722003
+  codigo_contrato                    String   = HLA-2026-00146
+  codigo_proceso                     String   = HLA-DAF-CD-2026-0121
+  estado_contrato                    String   = Activo
+  estado_adjudicacion                String   = Confirmada y enviada
+  fecha_adjudicacion                 String   = 2026-09-21T21:28:55.9833333Z
+  divisa                             String   = DOP
+  valor_contratado                   Int32    = 139122
+  metodo_pago                        String   = Transferencia
+  plazo_pago_factura                 String   = 60 dÃ­as
+  descripcion                        String   = ADQUISICION DE SERVICIO DE REPARACION DE AUTOCLAVE.)           
+  fecha_creacion_contrato            String   = 2026-09-21T21:29:51.3831533Z
+  url_contrato                       String   = https://comunidad.comprasdominicana.gob.do/Public/Tendering/ContractDe...
+  unidad_compra                      String   = Hospital Local El Almirante
+  codigo_unidad_compra               String   = 1161
+  rpe                                String   = 109993
+  razon_social                       String   = HOSPITRONICA SRL
+
+=== /ofertas ===
+totalResults: 1476082 | pages: 1476082
+  id_oferta                          String   = DO1.RPL.5768307
+  codigo_proceso                     String   = HLA-DAF-CD-2026-0129
+  codigo_unidad_compra               Int32    = 1161
+  unidad_compra                      String   = Hospital Local El Almirante
+  rpe                                String   = 75353
+  razon_social                       String   = Oresmil, SRL
+  nombre_oferta                      String   = ADQUISICION DE SERVICIO DE MATENIMIENTO DE AIRE ACONDICIONADO EN DIFER...
+  valor_oferta                       Int32    = 61242
+  estado_oferta                      String   = Cargada
+  estado_evaluacion                  String   = Pendiente
+  tipo_oferta                        String   = Oferta fÃ­sica
+  fecha_creacion                     String   = 2026-09-21T20:37:53.563Z
+  fecha_entrega_oferta               String   = 2026-09-21T10:00:00Z
+  fecha_evaluacion                   null     = 
+
+=== /proveedores ===
+totalResults: 128301 | pages: 128301
+  rpe                                Int32    = 1
+  razon_social                       String   = Ediciones Valdes, SRL
+  tipo_documento                     String   = RNC
+  numero_documento                   String   = 101870087
+  estado                             String   = Activo
+  genero                             String   = Masculino
+  tipo_persona                       String   = Persona JurÃ­dica
+  forma_juridica                     String   = Sociedades Comerciales
+  fecha_creacion_empresa             String   = 2001-08-03T08:00:00Z
+  fecha_registro_rpe                 String   = 2005-11-21T13:31:00Z
+  numero_registro_mercantil          String   = 19817SD
+  fecha_registro_mercantil           String   = 2021-03-18T04:00:00Z
+  es_mipyme                          String   = No
+  certificacion_micm                 String   = No
+  fecha_vencimiento_certificacion_micm null     = 
+  clasificacion                      String   = No clasificada
+  productor_nacional                 String   = No
+  clasificacion_empresarial          String   = No clasificada
+  clasificacion_empresarial_2        String   = Empresa no acogida a la Ley 187-17
+  telefono_comercial                 String   = 809-687-8828
+  celular_comercial                  null     = 
+  correo_comercial                   String   = cobros@e_valdes.com
+  direccion                          String   = Calle Arzobispo Nouel, 53, Zona Colonial
+  provee                             String   = Bienes
+  contacto                           String   = J. ANTONIO TOLENTINO 
+  posicion_contacto                  String   = Gerente
+  telefono_contacto                  String   = 809-766-0030
+  celular_contacto                   null     = 
+  correo_contacto                    String   = cobros@e_valdes.com
+  url_certificacion                  String   = https://www.dgcp.gob.do/constancia/descargar/700370521
+  pais                               String   = REPÃBLICA DOMINICANA
+  region                             String   = OZAMA O METROPOLITANA
+  provincia                          String   = DISTRITO NACIONAL
+  municipio                          String   = DISTRITO NACIONAL
+  distrito_municipal                 null     = 

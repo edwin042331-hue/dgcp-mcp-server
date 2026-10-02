@@ -1,0 +1,31 @@
+name: CI - Verificación de Integridad y Pruebas Unitarias
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test-and-build:
+    name: Pruebas Vitest y Compilación TypeScript
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar Código Fuente (Checkout)
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js (v20)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Instalar Dependencias
+        run: npm ci
+
+      - name: Ejecutar Pruebas Unitarias Automatizadas (Vitest)
+        run: npm test
+
+      - name: Compilar Proyecto (TypeScript)
+        run: npm run build
