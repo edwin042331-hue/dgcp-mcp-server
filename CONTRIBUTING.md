@@ -14,9 +14,10 @@ Para preservar la estabilidad, seguridad y exactitud legal de la suite, **la ram
 
 1. **TypeScript Estricto:** Todo código nuevo debe estar en TypeScript con esquemas de validación Zod.
 2. **Pruebas Obligatorias:** Cada herramienta o corrección de bug debe incluir sus respectivas pruebas en la carpeta `tests/`.
-3. **CI en Verde:** GitHub Actions ejecutará automáticamente `npm test` y `npm run build` en tu PR. Si alguna prueba falla, el PR no podrá ser integrado.
-4. **Respeto a la API Oficial:** La API de la DGCP (`https://datosabiertos.dgcp.gob.do/api-dgcp/v1`) no filtra del lado del servidor. Toda lógica de ordenamiento y filtrado debe realizarse en el cliente local con manejo de caché y concurrencia.
-5. **Rigor Normativo:** Si agregas funciones jurídicas, debes citar la base legal oficial (Ley 340-06, Decreto 543-12, Decreto 416-23 o Resoluciones vigentes de la DGCP) e incluir la cláusula de advertencia de revisión humana.
+3. **CI en Verde:** GitHub Actions ejecuta typecheck, pruebas, compilación y una verificación de arranque del servidor en Node 20, 22 y 24. Si algo falla, el PR no se integra.
+4. **Respeto a la API Oficial:** usa los filtros del servidor que la API sí soporta (proceso, RPE, unidad de compra, estado, fechas) a través de `dgcpListar`/`dgcpGet`, que ya aplican límite de tasa (la API corta en 60 peticiones/minuto), reintentos y caché. Nunca llames a `fetch` directamente ni recorras decenas de páginas a ciegas. Lee [docs/API-DGCP.md](docs/API-DGCP.md) antes de tocar la capa de datos.
+5. **Fechas:** la API rotula como UTC horas que son de República Dominicana. Usa siempre `parseFechaDGCP` y los formateadores de `src/utils/fechas.ts`; nunca `Date.parse` sobre un campo de la API.
+6. **Rigor Normativo:** toda cifra o artículo legal va en `src/normativa.ts`, citando el texto oficial (Ley 47-25, Decreto 52-26, resoluciones de umbrales vigentes; Ley 340-06 solo para el régimen transitorio), con su prueba en `tests/normativa.test.ts` y el aviso de revisión humana.
 
 ---
 
@@ -30,14 +31,14 @@ cd dgcp-mcp-server
 # 2. Instala dependencias
 npm install
 
-# 3. Ejecuta las pruebas automatizadas
-npm test
+# 3. Verifica tipos y ejecuta las pruebas unitarias (sin red)
+npm run check
 
-# 4. Inicia el inspector visual en tu navegador
+# 4. Prueba las 17 herramientas contra la API real
+npm run smoke:live
+
+# 5. Inspector visual en el navegador
 npm run inspect
-
-# 5. Compila el proyecto
-npm run build
 ```
 
 ---

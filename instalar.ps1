@@ -14,7 +14,7 @@ Write-Host ""
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 if (-not $nodeCmd) {
     Write-Host "ERROR: Node.js no esta instalado o no esta en el PATH." -ForegroundColor Red
-    Write-Host "Instalalo desde https://nodejs.org (version 18 o superior) y vuelve a correr este script."
+    Write-Host "Instalalo desde https://nodejs.org (version 20 o superior) y vuelve a correr este script."
     exit 1
 }
 $nodeExe = $nodeCmd.Source
@@ -23,8 +23,8 @@ Write-Host "Node encontrado: $nodeVer" -ForegroundColor Green
 Write-Host "Ejecutable: $nodeExe"
 
 $major = [int](($nodeVer -replace '^v','') -split '\.')[0]
-if ($major -lt 18) {
-    Write-Host "ERROR: se necesita Node 18 o superior. Tienes $nodeVer." -ForegroundColor Red
+if ($major -lt 20) {
+    Write-Host "ERROR: se necesita Node 20 o superior. Tienes $nodeVer." -ForegroundColor Red
     exit 1
 }
 
@@ -33,8 +33,8 @@ Write-Host ""
 Write-Host "Instalando dependencias (npm install)..." -ForegroundColor Cyan
 Push-Location $raiz
 try {
-    & npm install --no-fund --no-audit
-    if ($LASTEXITCODE -ne 0) { throw "npm install fallo con codigo $LASTEXITCODE" }
+    & npm ci --no-fund --no-audit
+    if ($LASTEXITCODE -ne 0) { throw "npm ci fallo con codigo $LASTEXITCODE" }
 
     Write-Host "Compilando TypeScript..." -ForegroundColor Cyan
     & npx tsc
@@ -146,5 +146,5 @@ Write-Host "Siguiente paso:"
 Write-Host "  - Claude Desktop: cierralo por completo y vuelve a abrirlo."
 Write-Host "  - Gemini CLI:     abre 'gemini' y escribe /mcp para ver el servidor dgcp."
 Write-Host ""
-Write-Host "Prueba: 'Que licitaciones de tecnologia estan abiertas ahora mismo?'"
+Write-Host "Prueba: 'Cual es la ultima licitacion publicada?' o 'Que licitaciones de tecnologia estan abiertas?'"
 Write-Host ""

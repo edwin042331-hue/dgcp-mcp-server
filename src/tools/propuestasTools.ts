@@ -1,250 +1,197 @@
 // src/tools/propuestasTools.ts
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  dgcpGetVariasPaginas, formatMonto, truncate, fixEncoding,
-  normalizar, soloFecha, DgcpApiError,
-} from "../services/dgcpClient.js";
-import { TAMANO_PAGINA_API, MAX_RESPONSE_CHARS } from "../constants.js";
+import { dgcpListar } from "../services/dgcpClient.js";
+import { formatMonto, formatPct, fixEncoding } from "../utils/texto.js";
+import { formatFechaHoraRD, fechaISORD } from "../utils/fechas.js";
+import { regimenAplicable, describirRegimen, exentaDeSeriedad, GARANTIAS, AVISO_LEGAL } from "../normativa.js";
+import { texto, seguro, CALCULO_LOCAL, SOLO_LECTURA } from "./comun.js";
 import type { ProcesoReal } from "../types.js";
 
-// ============================================================================
-// 1. TOOL: dgcp_generador_propuesta_sncc (Generador de Formularios Sobre A y B)
-// ============================================================================
+export const ITBIS = 0.18;
+
+export interface Escenario {
+  pct: number;
+  precio: number;
+  margen: number;
+  margenPct: number;
+  puntosEconomicos: number;
+  puntajeTotal: number;
+}
+
+/**
+ * Formula de proporcionalidad inversa de uso comun en pliegos del SNCP:
+ *   puntos = (precio_minimo / precio_ofertado) * puntos_maximos
+ * El precio minimo es el menor entre las ofertas rivales esperadas y la propia.
+ */
+export function simularEscenarios(p: {
+  referencial: number;
+  costo: number;
+  puntajeTecnico: number;
+  pesoEconomico: number;
+  preciosRivales: number[];
+  porcentajes?: number[];
+}): Escenario[] {
+  const pcts = p.porcentajes ?? [0.85, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1.0];
+  return pcts.map((pct) => {
+    const precio = p.referencial * pct;
+    const minimo = Math.min(precio, ...p.preciosRivales.filter((x) => x > 0));
+    const puntosEconomicos = precio > 0 ? Math.min(p.pesoEconomico, (minimo / precio) * p.pesoEconomico) : 0;
+    const margen = precio - p.costo;
+    return {
+      pct, precio, margen,
+      margenPct: precio > 0 ? (margen / precio) * 100 : 0,
+      puntosEconomicos,
+      puntajeTotal: p.puntajeTecnico + puntosEconomicos,
+    };
+  });
+}
+
 const GeneradorSchema = z.object({
-  codigo_proceso: z.string().describe("Codigo oficial del proceso en la DGCP (ej. 'INFOTEP-DAF-CM-2026-0080')."),
-  razon_social: z.string().describe("Nombre o razon social de tu empresa oferente."),
-  rnc: z.string().describe("Numero de RNC o identificacion tributaria de tu empresa."),
-  rpe: z.union([z.string(), z.number()]).describe("Numero de Registro de Proveedores del Estado (RPE)."),
-  representante_legal: z.string().describe("Nombre completo del representante legal o titular."),
-  cedula_representante: z.string().describe("Numero de cedula del representante legal."),
-  monto_ofertado_subtotal: z.number().positive().describe("Monto subtotal de tu oferta economica antes de ITBIS en DOP."),
-  descripcion_servicio: z.string().optional().describe("Breve descripcion de los bienes, software o consultoria a ofertar."),
-  tiempo_entrega_dias: z.number().int().positive().optional().default(15).describe("Tiempo de entrega o ejecucion en dias calendario."),
+  codigo_proceso: z.string().min(3).describe("Codigo oficial del proceso."),
+  razon_social: z.string().min(2).describe("Razon social del oferente."),
+  rnc: z.string().min(3),
+  rpe: z.union([z.string(), z.number()]),
+  representante_legal: z.string().min(3),
+  cedula_representante: z.string().min(3),
+  monto_ofertado_subtotal: z.number().positive().describe("Subtotal de la oferta antes de ITBIS (DOP)."),
+  aplica_itbis: z.boolean().optional().describe("false si el bien o servicio esta exento de ITBIS (default true, 18%)."),
+  es_mipyme: z.boolean().optional().describe("true si el oferente es MIPYME certificada."),
+  descripcion_oferta: z.string().optional().describe("Descripcion breve de lo ofertado."),
+  plazo_entrega_dias: z.number().int().positive().optional().describe("Plazo de entrega o ejecucion en dias calendario (default 15)."),
 }).strict();
 
-type GeneradorInput = z.infer<typeof GeneradorSchema>;
+const SimuladorSchema = z.object({
+  monto_referencial: z.number().positive().describe("Presupuesto estimado oficial (DOP)."),
+  costo_total: z.number().positive().describe("Tu costo total de ejecucion (DOP)."),
+  puntaje_tecnico_esperado: z.number().min(0).max(100).optional().describe("Puntos tecnicos que esperas obtener (default 70)."),
+  peso_tecnico_max: z.number().min(0).max(100).optional().describe("Puntos maximos tecnicos segun el pliego (default 70)."),
+  peso_economico_max: z.number().min(0).max(100).optional().describe("Puntos maximos economicos segun el pliego (default 30)."),
+  precios_competidores: z.array(z.number().positive()).optional().describe("Precios esperados o historicos de rivales (ver dgcp_buscar_ofertas / dgcp_precios_referencia)."),
+  margen_minimo_pct: z.number().min(0).max(90).optional().describe("Margen minimo aceptable en % (default 8)."),
+}).strict();
 
 export function registerPropuestasTools(server: McpServer): void {
   server.registerTool("dgcp_generador_propuesta_sncc", {
-    title: "Generador de Formularios Oficiales SNCC y Expediente (Sobre A y B)",
-    description: `Genera de forma instantánea la documentación formal normalizada exigida por la DGCP bajo el Sistema Nacional de Compras y Contrataciones Públicas (SNCC):
-1. Formulario de Información sobre el Oferente (SNCC.F.042).
-2. Declaración Jurada Notarial del Artículo 14 de la Ley 340-06.
-3. Carta Formal de Presentación de la Oferta y Compromiso.
-4. Formulario de Oferta Económica (SNCC.F.033) con desglose matemático exacto de ITBIS (18%) y total.
-5. Checklist de verificación previa para garantizar admisibilidad del Sobre A.`,
-    inputSchema: GeneradorSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async (params: GeneradorInput) => {
-    try {
-      const codNorm = normalizar(params.codigo_proceso);
-      const procData = await dgcpGetVariasPaginas<ProcesoReal>("procesos", 8, TAMANO_PAGINA_API);
-      const proceso = procData.items.find((p) => normalizar(p.codigo_proceso) === codNorm);
-
-      const tituloProceso = proceso?.titulo ? fixEncoding(proceso.titulo) : "Proceso de Contratación Pública";
-      const institucion = proceso?.unidad_compra ? fixEncoding(proceso.unidad_compra) : "Institución Contratante";
-      const fechaActual = new Date().toLocaleDateString("es-DO", { year: "numeric", month: "long", day: "numeric" });
-
-      const subtotal = params.monto_ofertado_subtotal;
-      const itbis = subtotal * 0.18;
-      const total = subtotal + itbis;
-
-      const out = [
-        `# EXPEDIENTE OFICIAL DE PROPUESTA (SNCC - LEY 340-06)`,
-        `**Proceso:** ${params.codigo_proceso}`,
-        `**Institución:** ${institucion}`,
-        `**Oferente:** ${params.razon_social} (RNC: ${params.rnc} | RPE: ${params.rpe})`,
-        `**Fecha:** ${fechaActual}`,
-        "================================================================================",
-        "",
-        `## 📄 DOCUMENTO 1: CARTA DE PRESENTACIÓN DE LA OFERTA Y COMPROMISO`,
-        `**A:** Comité de Compras y Contrataciones / Unidad Operativa de Compras`,
-        `**Entidad:** ${institucion}`,
-        `**Referencia:** Proceso No. ${params.codigo_proceso}`,
-        "",
-        `Distinguidos Señores:`,
-        "",
-        `Quien suscribe, **${params.representante_legal}**, dominicano(a), mayor de edad, portador(a) de la Cédula de Identidad y Electoral No. **${params.cedula_representante}**, actuando en calidad de Representante Legal de la empresa **${params.razon_social}**, RNC No. **${params.rnc}**, Registro de Proveedor del Estado (RPE) No. **${params.rpe}**, formalmente presenta propuesta para el proceso de referencia correspondiente a:`,
-        `*"${tituloProceso}"*.`,
-        "",
-        `Declaramos formalmente bajo la gravedad del juramento que:`,
-        `1. Hemos examinado detenidamente el Pliego de Condiciones Específicas, Especificaciones Técnicas y Enmiendas del presente proceso, aceptando íntegramente sus disposiciones sin reservas ni salvedades.`,
-        `2. Nos comprometemos a ejecutar y entregar los bienes/servicios en un plazo de **${params.tiempo_entrega_dias} días calendario**, contados a partir de la firma del contrato o recepción de la orden de compra.`,
-        `3. Nuestra oferta económica total asciende a la suma de **${formatMonto(total)} (incluye ITBIS)**.`,
-        `4. Esta oferta se mantendrá vigente por el período exigido en el pliego de condiciones.`,
-        "",
-        `Atentamente,`,
-        `_____________________________________________`,
-        `**${params.representante_legal}**`,
-        `Por: ${params.razon_social}`,
-        "",
-        "================================================================================",
-        "",
-        `## 📄 DOCUMENTO 2: FORMULARIO DE INFORMACIÓN SOBRE EL OFERENTE (SNCC.F.042)`,
-        `- **Razón Social:** ${params.razon_social}`,
-        `- **Nombre Comercial:** ${params.razon_social}`,
-        `- **RNC:** ${params.rnc}`,
-        `- **Registro de Proveedor del Estado (RPE):** ${params.rpe}`,
-        `- **Representante Legal:** ${params.representante_legal}`,
-        `- **Cédula Representante:** ${params.cedula_representante}`,
-        `- **País de Constitución:** República Dominicana`,
-        `- **Tipo de Persona:** Persona Jurídica / MIPYME`,
-        `- **Servicios a Ofertar:** ${params.descripcion_servicio || tituloProceso}`,
-        `- **Garantía Técnica:** Garantía de cumplimiento y soporte técnico directo en territorio dominicano.`,
-        "",
-        "================================================================================",
-        "",
-        `## 📄 DOCUMENTO 3: DECLARACIÓN JURADA ART. 14 LEY 340-06 (LISTA PARA NOTARIO)`,
-        `*ACTO NÚMERO: [___________].-*`,
-        `En la ciudad de Santo Domingo, República Dominicana, a los [____] días del mes de [________] del año [____].`,
-        `Ante mí, [Nombre del Notario], Notario Público de los del Número del Distrito Nacional, comparece libre y voluntariamente el(la) señor(a) **${params.representante_legal}**, de nacionalidad dominicana, mayor de edad, titular de la Cédula de Identidad y Electoral No. **${params.cedula_representante}**, quien actúa en su calidad de Representante Legal de la entidad comercial **${params.razon_social}**, RNC No. **${params.rnc}**, y me declara bajo la fe del juramento lo siguiente:`,
-        "",
-        `**PRIMERO:** Que ni el declarante, ni la sociedad comercial que representa, ni sus socios o directivos, se encuentran afectados por ninguna de las inhabilidades, prohibiciones e incompatibilidades previstas en el **Artículo 14 de la Ley No. 340-06** sobre Compras y Contrataciones de Bienes, Servicios, Obras y Concesiones, ni sus modificaciones.`,
-        `**SEGUNDO:** Que dicha sociedad comercial no se encuentra en estado de quiebra, liquidación judicial, ni tiene juicios pendientes con el Estado Dominicano ni con ninguna de sus dependencias.`,
-        `**TERCERO:** Que se encuentra al día en el cumplimiento de sus obligaciones tributarias ante la Dirección General de Impuestos Internos (DGII) y de seguridad social ante la Tesorería de la Seguridad Social (TSS).`,
-        "",
-        `DECLARACIÓN QUE HACE EN VIRTUD DE LA LEY PARA SER PRESENTADA EN EL PROCESO: **${params.codigo_proceso}**.`,
-        "",
-        `____________________________________       ____________________________________`,
-        `       COMPARECIENTE / OFERENTE                         NOTARIO PÚBLICO`,
-        "",
-        "================================================================================",
-        "",
-        `## 📄 DOCUMENTO 4: FORMULARIO DE OFERTA ECONÓMICA (SNCC.F.033 - SOBRE B)`,
-        `| Ítem | Descripción del Bien / Servicio | Cant. | Unidad | Precio Unitario (DOP) | ITBIS (18%) | Total Ofertado (DOP) |`,
-        `|:---:|:---|:---:|:---:|:---:|:---:|:---:|`,
-        `| 1 | ${fixEncoding(params.descripcion_servicio || tituloProceso)} | 1 | Servicio | ${formatMonto(subtotal)} | ${formatMonto(itbis)} | **${formatMonto(total)}** |`,
-        "",
-        `- **Subtotal Neto:** ${formatMonto(subtotal)}`,
-        `- **ITBIS de Ley (18%):** ${formatMonto(itbis)}`,
-        `- **VALOR TOTAL GENERAL DE LA OFERTA:** **${formatMonto(total)}**`,
-        `- **Condiciones de Pago:** Según lo estipulado en el pliego de condiciones de la institución.`,
-        `- **Moneda:** Pesos Dominicanos (DOP).`,
-        "",
-        "================================================================================",
-        "",
-        `## 📋 CHECKLIST PREVENTIVO DE ADMISIBILIDAD (SOBRE A)`,
-        `Antes de cargar la oferta al Portal Transaccional, verifica que adjuntas:`,
-        `[ ] Copia de Constancia de Registro de Proveedores del Estado (RPE) activo.`,
-        `[ ] Certificación al día de la Dirección General de Impuestos Internos (DGII).`,
-        `[ ] Certificación vigente de la Tesorería de la Seguridad Social (TSS).`,
-        `[ ] Certificación MIPYME emitida por el Ministerio de Industria, Comercio y Mipymes (MICM).`,
-        `[ ] Copia del Registro Mercantil vigente de la Cámara de Comercio.`,
-        `[ ] Copia de Cédula del Representante Legal.`,
-        `[ ] Declaración Jurada Art. 14 Ley 340-06 notariada.`,
-        `[ ] Propuesta Técnica y Metodología de Trabajo firmada.`,
-        `[ ] Formulario de Oferta Económica SNCC.F.033 firmado y sellado (Dentro del Sobre B).`,
-      ];
-
-      return { content: [{ type: "text", text: truncate(out.join("\n"), MAX_RESPONSE_CHARS) }] };
-    } catch (err) {
-      if (err instanceof DgcpApiError) {
-        return { content: [{ type: "text", text: `Error al generar expediente SNCC: ${err.message}` }] };
-      }
-      throw err;
-    }
-  });
-
-  // ============================================================================
-  // 2. TOOL: dgcp_simulador_puntuacion (Simulador Matemático Oficial DGCP)
-  // ============================================================================
-  const SimuladorSchema = z.object({
-    monto_referencial: z.number().positive().describe("Monto estimado oficial del proceso en DOP."),
-    costo_ejecucion_base: z.number().positive().describe("Tus costos reales directos e indirectos de ejecucion en DOP."),
-    puntaje_tecnico_esperado: z.number().min(0).max(100).optional().default(70)
-      .describe("Puntos que esperas obtener en el Sobre A (default 70)."),
-    peso_tecnico_max: z.number().min(0).max(100).optional().default(70)
-      .describe("Puntos maximos del Sobre Tecnico segun pliego (default 70)."),
-    peso_economico_max: z.number().min(0).max(100).optional().default(30)
-      .describe("Puntos maximos del Sobre Economico segun pliego (default 30)."),
-    precios_competidores: z.array(z.number()).optional()
-      .describe("Array con precios estimados o historicos de competidores (opcional)."),
-  }).strict();
-
-  type SimuladorInput = z.infer<typeof SimuladorSchema>;
-
-  server.registerTool("dgcp_simulador_puntuacion", {
-    title: "Simulador Matemático de Adjudicación y Puntuación DGCP",
-    description: `Calcula con la fórmula matemática oficial de la DGCP el precio óptimo para ganar la licitación:
-Fórmula: Puntos_Economicos = (Precio_Minimo_Valido / Precio_Oferta) * Peso_Economico_Maximo.
-Puntaje Total = Puntos_Tecnicos + Puntos_Economicos.
-
-Genera una matriz de sensibilidad evaluando escenarios de precio (90%, 92%, 94%, 96%, 98% del valor referencial)
-mostrando margen bruto en DOP, margen en %, puntaje total estimado y recomendación estratégica senior.`,
-    inputSchema: SimuladorSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async (params: SimuladorInput) => {
-    const ref = params.monto_referencial;
-    const costo = params.costo_ejecucion_base;
-    const pTec = params.puntaje_tecnico_esperado;
-    const pesoEcon = params.peso_economico_max;
-
-    const porcentajes = [0.90, 0.92, 0.94, 0.96, 0.98, 1.00];
-    const escenarios = porcentajes.map((pct) => {
-      const precioOfertado = ref * pct;
-      const ganancia = precioOfertado - costo;
-      const margenPct = precioOfertado > 0 ? (ganancia / precioOfertado) * 100 : 0;
-
-      // Suponemos que el precio mínimo en el mercado ronda entre el 90% y 92%
-      const precioMinimoEstimado = params.precios_competidores && params.precios_competidores.length > 0
-        ? Math.min(...params.precios_competidores, precioOfertado)
-        : ref * 0.90;
-
-      const pEcon = precioOfertado > 0 ? (precioMinimoEstimado / precioOfertado) * pesoEcon : 0;
-      const pTotal = pTec + pEcon;
-
-      return {
-        pct: `${Math.round(pct * 100)}%`,
-        precio: precioOfertado,
-        ganancia,
-        margenPct,
-        pEcon: Math.min(pesoEcon, pEcon),
-        pTotal,
-      };
-    });
+    title: "Generador de borradores de oferta (Sobre A y B)",
+    description: `Genera borradores de la carta de presentacion, la declaracion jurada de no estar en el regimen de inhabilidades (Arts. 38-39 Ley 47-25), la oferta economica con ITBIS y el checklist del expediente, con los datos reales del proceso.
+Ajusta las garantias y el anticipo si el oferente es MIPYME (Arts. 174-175 Ley 47-25). Usa siempre los formularios estandar que publica el pliego del proceso: esto es un borrador para completarlos.`,
+    inputSchema: GeneradorSchema.shape,
+    annotations: SOLO_LECTURA,
+  }, seguro("Error generando el expediente", async (p: z.infer<typeof GeneradorSchema>) => {
+    const proc = await dgcpListar<ProcesoReal>("procesos", { proceso: p.codigo_proceso.trim() }, { maxPaginas: 1, limite: 5 });
+    const pr = proc.items[0];
+    const titulo = pr?.titulo ? fixEncoding(pr.titulo).trim() : "[Objeto del procedimiento]";
+    const institucion = pr?.unidad_compra ? fixEncoding(pr.unidad_compra) : "[Institucion contratante]";
+    const regimen = regimenAplicable(pr?.fecha_publicacion);
+    const subtotal = p.monto_ofertado_subtotal;
+    const itbis = p.aplica_itbis === false ? 0 : subtotal * ITBIS;
+    const total = subtotal + itbis;
+    const plazo = p.plazo_entrega_dias ?? 15;
+    const hoy = fechaISORD();
+    const seriedadExenta = p.es_mipyme || exentaDeSeriedad(pr?.modalidad);
 
     const out = [
-      `# SIMULACIÓN MATEMÁTICA DE ADJUDICACIÓN DGCP (Ley 340-06)`,
-      `**Presupuesto Referencial:** ${formatMonto(ref)}`,
-      `**Costo Base de Ejecución:** ${formatMonto(costo)}`,
-      `**Ponderación del Pliego:** Técnico ${params.peso_tecnico_max} pts | Económico ${params.peso_economico_max} pts (Total 100 pts)`,
-      `**Puntaje Técnico Esperado (Sobre A):** ${pTec} / ${params.peso_tecnico_max} pts`,
-      "---",
-      `## 1. Matriz de Sensibilidad de Escenarios de Precio`,
-      `| % Presupuesto | Precio Ofertado (DOP) | Margen Bruto (DOP) | Margen % | Puntos Económicos | PUNTAJE TOTAL | Competitividad |`,
-      `|:---:|:---:|:---:|:---:|:---:|:---:|:---:|`,
+      `# Borrador de expediente de oferta`,
+      `**Procedimiento:** ${p.codigo_proceso} - ${titulo}`,
+      `**Institucion:** ${institucion}${pr ? ` | Cierre: ${formatFechaHoraRD(pr.fecha_fin_recepcion_ofertas)} (hora RD)` : ""}`,
+      `**Regimen:** ${describirRegimen(regimen)}`,
+      !pr ? "_Aviso: el proceso no aparece en la API; verifica el codigo._" : "",
+      "",
+      "## 1. Carta de presentacion de la oferta",
+      `Santo Domingo, ${hoy}`,
+      `Senores Comite de Contrataciones Publicas, ${institucion}`,
+      `Ref.: Procedimiento ${p.codigo_proceso}`,
+      "",
+      `Quien suscribe, ${p.representante_legal}, cedula ${p.cedula_representante}, en representacion de ${p.razon_social} (RNC ${p.rnc}, RPE ${p.rpe}), presenta oferta para "${titulo}" y declara que:`,
+      "1. Conoce y acepta el pliego de condiciones, sus enmiendas y circulares.",
+      `2. Se compromete a entregar/ejecutar en ${plazo} dias calendario desde la firma del contrato u orden de compra.`,
+      `3. El precio total ofertado es ${formatMonto(total)}${itbis > 0 ? " (ITBIS incluido)" : " (exento de ITBIS)"}.`,
+      "4. Mantendra la oferta durante el plazo de vigencia exigido en el pliego.",
+      "", "_____________________________", `${p.representante_legal} - ${p.razon_social}`,
+      "",
+      "## 2. Declaracion jurada (para notarizar si el pliego lo exige)",
+      `Yo, ${p.representante_legal}, cedula ${p.cedula_representante}, en representacion de ${p.razon_social}, RNC ${p.rnc}, declaro bajo fe de juramento que:`,
+      regimen === "ley_340_06"
+        ? "PRIMERO: Ni la empresa ni sus socios, directivos o representantes estan afectados por las prohibiciones del Art. 14 de la Ley 340-06, aplicable a este proceso por el regimen transitorio."
+        : "PRIMERO: Ni la empresa ni sus socios, directivos o representantes estan comprendidos en el regimen de inhabilidades y prohibiciones para contratar de los Arts. 38 y 39 de la Ley 47-25.",
+      "SEGUNDO: La empresa no esta en quiebra, liquidacion ni concurso de acreedores, y esta al dia con sus obligaciones tributarias (DGII) y de seguridad social (TSS).",
+      "TERCERO: No ha incurrido en practicas colusorias ni ha acordado precios o condiciones con otros oferentes de este procedimiento (Art. 116 Ley 47-25).",
+      "CUARTO: Toda la informacion y documentacion presentada es veraz.",
+      "", "_____________________________", "Firma / Notario Publico",
+      "",
+      "## 3. Oferta economica (Sobre B)",
+      "| Item | Descripcion | Cant. | Precio unitario | ITBIS | Total |",
+      "|---|---|---|---|---|---|",
+      `| 1 | ${fixEncoding(p.descripcion_oferta ?? titulo).replace(/\|/g, "/")} | 1 | ${formatMonto(subtotal)} | ${formatMonto(itbis)} | ${formatMonto(total)} |`,
+      "",
+      `Subtotal ${formatMonto(subtotal)} + ITBIS ${formatMonto(itbis)} = **${formatMonto(total)}**. Desglosa por articulo usando la lista oficial (dgcp_inteligencia_proceso).`,
+      "",
+      "## 4. Garantias y condiciones",
+      seriedadExenta
+        ? `- Garantia de seriedad: no requerida (${p.es_mipyme ? "MIPYME, Art. 175.2 Ley 47-25" : "modalidad exenta, Art. 201 Dec. 52-26"}).`
+        : `- Garantia de seriedad: 1% de la oferta = ${formatMonto(total * GARANTIAS.SERIEDAD_OFERTA_PCT)}, dentro del Sobre B (Art. 202 Dec. 52-26).`,
+      `- Si resultas adjudicatario: fiel cumplimiento ${p.es_mipyme ? `1% (MIPYME) = ${formatMonto(total * GARANTIAS.FIEL_CUMPLIMIENTO_MIPYME_PCT)}` : `4% = ${formatMonto(total * GARANTIAS.FIEL_CUMPLIMIENTO_PCT)}`} en 5 dias habiles (Arts. 205-207 Dec. 52-26).`,
+      p.es_mipyme ? `- Anticipo MIPYME: 30% al firmar = ${formatMonto(total * GARANTIAS.ANTICIPO_MIPYME_PCT)}, con garantia de buen uso por ese monto (Art. 174 Ley 47-25; Art. 210 Dec. 52-26). Solo pueden exigirte fianzas de aseguradoras (Art. 175.1).` : "",
+      "",
+      "## 5. Checklist del expediente",
+      "[ ] Constancia de RPE activo y con el rubro del objeto",
+      p.es_mipyme
+        ? "[ ] Certificaciones de DGII y TSS (una MIPYME puede participar con atrasos de hasta 6 meses, Art. 172 P. III Ley 47-25)"
+        : "[ ] Certificaciones al dia de DGII y TSS",
+      p.es_mipyme ? "[ ] Certificacion MIPYME vigente del MICM" : "[ ] (Si aplica) certificacion MIPYME del MICM",
+      "[ ] Registro mercantil vigente y documentos societarios",
+      "[ ] Declaracion jurada firmada (y notarizada si el pliego lo pide)",
+      "[ ] Oferta tecnica conforme a las especificaciones del pliego",
+      "[ ] Formularios estandar del pliego completos y firmados",
+      seriedadExenta ? "" : "[ ] Garantia de seriedad (1%) dentro del Sobre B",
+      "[ ] Oferta economica firmada y sellada",
+      "", `_${AVISO_LEGAL}_`,
     ];
+    return texto(out.filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n"));
+  }));
 
-    escenarios.forEach((esc) => {
-      const competitividad = esc.pTotal >= (pTec + pesoEcon * 0.95)
-        ? "⭐⭐⭐ Muy Alta (Líder)"
-        : esc.pTotal >= (pTec + pesoEcon * 0.90)
-        ? "⭐⭐ Alta (Competitiva)"
-        : "⭐ Moderada (Riesgo)";
-
-      out.push(
-        `| ${esc.pct} | ${formatMonto(esc.precio)} | ${formatMonto(esc.ganancia)} | ${esc.margenPct.toFixed(1)}% | ${esc.pEcon.toFixed(2)} pts | **${esc.pTotal.toFixed(2)} pts** | ${competitividad} |`
-      );
+  server.registerTool("dgcp_simulador_puntuacion", {
+    title: "Simulador de precio y puntuacion economica",
+    description: `Simula escenarios de precio (85% a 100% del presupuesto) con la formula de proporcionalidad inversa usada en los pliegos: puntos = (precio minimo / precio ofertado) x puntos maximos.
+Muestra margen y puntaje total por escenario y recomienda el que maximiza el puntaje respetando tu margen minimo.
+Para precios rivales reales usa dgcp_buscar_ofertas (ofertas de procesos similares) o dgcp_precios_referencia. Verifica siempre la formula exacta en el pliego.`,
+    inputSchema: SimuladorSchema.shape,
+    annotations: CALCULO_LOCAL,
+  }, seguro("Error en el simulador", async (p: z.infer<typeof SimuladorSchema>) => {
+    const pesoTec = p.peso_tecnico_max ?? 70;
+    const pesoEcon = p.peso_economico_max ?? 30;
+    const tecnico = Math.min(p.puntaje_tecnico_esperado ?? 70, pesoTec);
+    const rivales = p.precios_competidores ?? [];
+    const margenMin = p.margen_minimo_pct ?? 8;
+    const supuesto = rivales.length === 0;
+    const esc = simularEscenarios({
+      referencial: p.monto_referencial,
+      costo: p.costo_total,
+      puntajeTecnico: tecnico,
+      pesoEconomico: pesoEcon,
+      preciosRivales: supuesto ? [p.monto_referencial * 0.9] : rivales,
     });
+    const viables = esc.filter((e) => e.margenPct >= margenMin);
+    const mejor = viables.sort((a, b) => b.puntajeTotal - a.puntajeTotal || b.margen - a.margen)[0];
 
-    // Encontrar el precio balanceado óptimo (alrededor del 93% - 94%)
-    const optimo = escenarios.find((e) => e.pct === "94%") || escenarios[2];
-
-    out.push(
+    const out = [
+      "# Simulacion de precio y puntuacion",
+      `Presupuesto: ${formatMonto(p.monto_referencial)} | Tu costo: ${formatMonto(p.costo_total)} | Pesos: tecnico ${pesoTec}, economico ${pesoEcon} | Tecnico esperado: ${tecnico}`,
+      supuesto
+        ? "_Sin precios rivales: se supone que la oferta rival mas baja sera el 90% del presupuesto. Pasa precios_competidores para un resultado real._"
+        : `Precio rival mas bajo: ${formatMonto(Math.min(...rivales))}`,
       "",
-      `## 2. Recomendación Estratégica Senior`,
-      `- **Punto de Equilibrio Óptimo (Recomendado):** Ofertar al **${optimo.pct} del presupuesto referencial** (**${formatMonto(optimo.precio)}**).`,
-      `- **Beneficio Estimado:** Aseguras un margen bruto de **${formatMonto(optimo.ganancia)} (${optimo.margenPct.toFixed(1)}% de rentabilidad)**.`,
-      `- **Impacto en Puntuación:** Alcanzas **${optimo.pTotal.toFixed(2)} puntos sobre 100**, superando con solvencia a los competidores que típicamente ofertan al 98% o 100% por miedo a reducir margen.`,
-      `- **Alerta de Precio Temerario:** Ofertas en el rango del 90%-95% cumplen con los estándares de sostenibilidad de la DGCP (Art. 30 Ley 340-06), mitigando el riesgo de rechazo por precio temerario o ruinoso.`,
+      "| % presupuesto | Precio | Margen | Margen % | Pts economicos | Total |",
+      "|---|---|---|---|---|---|",
+      ...esc.map((e) => `| ${Math.round(e.pct * 100)}% | ${formatMonto(e.precio)} | ${formatMonto(e.margen)} | ${formatPct(e.margenPct)} | ${e.puntosEconomicos.toFixed(2)} | ${e.puntajeTotal.toFixed(2)} |`),
       "",
-      `---`,
-      `### 📌 Metodología Oficial y Advertencia Técnica:`,
-      `- **Fórmula Oficial Aplicada:** Modelo estándar de relación inversamente proporcional DGCP: \`(Pmin / Pof) * Puntos Asignados\`.`,
-      `- *Aviso de Simulación Económica: Esta simulación es un modelo predictivo basado en supuestos de comportamiento de mercado y fórmulas estándar del Sistema Nacional de Compras Públicas. La puntuación real está sujeta a los precios efectivos presentados por los demás oferentes en el acto de apertura del Sobre B y a la ponderación del Pliego de Condiciones Específicas.*`
-    );
-
-    return { content: [{ type: "text", text: out.join("\n") }] };
-  });
+      mejor
+        ? `**Recomendacion:** ofertar ${formatMonto(mejor.precio)} (${Math.round(mejor.pct * 100)}% del presupuesto): ${mejor.puntajeTotal.toFixed(2)} puntos con margen ${formatPct(mejor.margenPct)}.`
+        : `**Ningun escenario alcanza tu margen minimo de ${margenMin}%.** Con este costo no es rentable competir por precio; revisa costos o la estrategia tecnica.`,
+      "",
+      "_Notas: el puntaje real depende de las ofertas que se presenten y de la formula del pliego. Una oferta anormalmente baja puede ser cuestionada; justifica tu estructura de costos._",
+    ];
+    return texto(out.join("\n"));
+  }));
 }

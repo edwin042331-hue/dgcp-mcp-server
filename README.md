@@ -1,135 +1,127 @@
-# Servidor MCP Soberano - Contrataciones Públicas de República Dominicana (DGCP v4.1)
+# dgcp-mcp-server
 
-[![CI - Verificación y Pruebas](https://github.com/edwin042331-hue/dgcp-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/edwin042331-hue/dgcp-mcp-server/actions/workflows/ci.yml)
-[![Tests: 17 Passed](https://img.shields.io/badge/Vitest-17%20Passed-brightgreen)](https://github.com/edwin042331-hue/dgcp-mcp-server)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Node.js: >=18](https://img.shields.io/badge/Node.js-%3E%3D18.0.0-green.svg)](https://nodejs.org/)
-[![Model Context Protocol](https://img.shields.io/badge/MCP-Official%20Standard-purple)](https://modelcontextprotocol.io/)
+[![CI](https://github.com/edwin042331-hue/dgcp-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/edwin042331-hue/dgcp-mcp-server/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node.js >= 20](https://img.shields.io/badge/Node.js-%3E%3D20-green.svg)](https://nodejs.org/)
+[![MCP](https://img.shields.io/badge/MCP-stdio-purple)](https://modelcontextprotocol.io/)
 
-Creamos este servidor MCP de código abierto para **centralizar, transparentar y poner al alcance de toda la comunidad dominicana los datos de compras públicas del Estado**. Conecta cualquier asistente o agente de IA (**Claude Desktop, Gemini CLI, Cursor, Antigravity**) con la API oficial de datos abiertos de la Dirección General de Contrataciones Públicas (**DGCP**).
+Servidor [Model Context Protocol](https://modelcontextprotocol.io/) que conecta cualquier asistente de IA (Claude, Cursor, Gemini CLI...) con la **API oficial de datos abiertos de la Dirección General de Contrataciones Públicas de República Dominicana (DGCP)**.
 
-- **Fuente Oficial:** `https://datosabiertos.dgcp.gob.do/api-dgcp/v1`
-- **Marco Legal:** Ley No. 340-06, Decreto No. 543-12, Decreto No. 416-23 (MIPYMES) y Resoluciones Vigentes de Umbrales Oficiales DGCP.
+Pregúntale a tu IA *"¿cuál es la última licitación?"*, *"¿qué puedo ofertar hoy con mi RPE?"*, *"¿a qué precio se han comprado estas laptops?"* o *"¿hay colusión en este proceso?"* y responde con datos oficiales, exactos y con la hora de República Dominicana.
 
----
-
-## 🚀 Suite Institucional Completa (13 Herramientas Verificadas)
-
-| # | Herramienta | Pilar Estratégico | Función Principal |
-|---|---|---|---|
-| 1 | `dgcp_buscar_licitaciones` | Rastreo Operativo | Búsqueda multitérmino de procesos abiertos con validación de cierre en milisegundos y reporte de cobertura. |
-| 2 | `dgcp_buscar_contratos` | Histórico y Pagos | Acceso a +722,000 contratos: adjudicatarios reales, montos, plazos (30, 60, 90+ días) y métodos de pago. |
-| 3 | `dgcp_buscar_ofertas` | Inteligencia de Mercado | Consulta de +1.47 millones de propuestas económicas y técnicas de competidores en Sobre A y B. |
-| 4 | `dgcp_buscar_proveedores` | Padrón RPE | Verificación de RNC, clasificación MIPYME del MICM, estatus y rubros comerciales registrados. |
-| 5 | `dgcp_inteligencia_proceso` | Cruce 360° | Análisis integral de licitación: quién ganó procesos anteriores, ofertas rivales y garantías legales obligatorias. |
-| 6 | `dgcp_radiografia_proveedor` | Análisis Competitivo | Volumen de facturación estatal acumulada, cuota de mercado e instituciones clientes principales. |
-| 7 | `dgcp_calculadora_legal` | Blindaje Jurídico | Cálculo de umbrales oficiales, detección de fraccionamiento, garantía de seriedad (1%) y póliza MIPYME (1% Dec. 416-23). |
-| 8 | `dgcp_generador_propuesta_sncc` | Expedientes Ganadores | Redacción instantánea de formularios oficiales SNCC (F.042, F.033 con 18% ITBIS y Declaración Jurada Art. 14 notariada). |
-| 9 | `dgcp_simulador_puntuacion` | Estrategia de Precio | Matriz matemática oficial DGCP `(Pmin / Pof) * Puntos` para determinar el precio óptimo ganador sin ser temerario. |
-| 10 | `dgcp_auditoria_colusion` | Forense Anti-Fraude | Detección de vínculos cruzados (teléfonos, correos o domicilios compartidos en RPE) bajo el Art. 65 del Dec. 543-12. |
-| 11 | `dgcp_scorecard_institucion` | Salud Financiera | Auditoría de días reales de pago por entidad, método de desembolso (cheque vs transferencia) y rating comercial. |
-| 12 | `dgcp_auditor_pliego_trampa` | Anti-Amarre de Pliegos | Detección de marcas comerciales sin equivalencia (violación Art. 21 Ley 340-06) y minuta de solicitud de aclaración técnica. |
-| 13 | `dgcp_generador_recurso_impugnacion` | Defensa Jurídica | Redacción formal de Recurso Jerárquico y Medida Cautelar de Suspensión de Oficio ante la DGCP (Ley 340-06 y Ley 107-13). |
+- **Fuente:** `https://datosabiertos.dgcp.gob.do/api-dgcp/v1` (solo lectura, sin credenciales).
+- **Marco legal:** Ley 47-25 de Contrataciones Públicas, su Reglamento (Decreto 52-26) y los umbrales 2026 (Resolución PNP-03-2026), con régimen transitorio de la Ley 340-06 para procesos convocados antes.
 
 ---
 
-## ⚡ Instalación Rápida
+## Herramientas (17)
 
-### Requisitos:
-- **Node.js:** Versión 18 o superior (`node -v`).
-- **NPM:** Incluido con Node.
+### Consulta
+| Herramienta | Qué responde |
+|---|---|
+| `dgcp_ultimas_licitaciones` | Lo último publicado (hoy, esta semana), del más reciente al más antiguo, con hora RD y tiempo restante para ofertar. |
+| `dgcp_buscar_licitaciones` | Procesos abiertos o en cualquier estado. Con `estado: "abierto"` revisa el universo **completo** de procesos publicados, no una muestra. Admite términos alternativos (`"laptop, computadora, servidor"`), institución por nombre/acrónimo/código, montos, fechas y orden. |
+| `dgcp_buscar_contratos` | Quién ganó, cuánto, cuándo, forma y plazo de pago. Filtros exactos por proceso, RPE o institución. |
+| `dgcp_buscar_ofertas` | Todas las ofertas de un proceso o de una empresa, ordenables por precio. |
+| `dgcp_buscar_proveedores` | Ficha RPE por RPE, RNC/cédula o nombre, con alerta si figura en la lista oficial de inhabilitados. |
 
-### Pasos:
+### Inteligencia
+| Herramienta | Qué responde |
+|---|---|
+| `dgcp_inteligencia_proceso` | Expediente 360° de un proceso: ficha y cronograma, artículos con código UNSPSC y precio estimado, documentos del pliego, ofertas, adjudicación, a quién le compra la institución, control de legalidad (plazo mínimo, modalidad vs. umbral, fecha límite de aclaraciones) y garantías según la ley aplicable. |
+| `dgcp_oportunidades_para_mi` | **Qué licitaciones abiertas encajan con lo que vende tu empresa**, cruzando todos los rubros UNSPSC registrados en tu RPE con los artículos de cada proceso vigente. Encuentra lo que una búsqueda por palabras pierde. |
+| `dgcp_precios_referencia` | A qué precio unitario el Estado contrató realmente un artículo (mínimo, P25, mediana, P75, máximo por unidad de medida) con ejemplos recientes. Para fijar precio o detectar sobreprecios. |
+| `dgcp_plan_compras` | Lo que una institución planea comprar en el año (PACC): monto, modalidad y fecha prevista. Para anticiparse a la licitación. |
+| `dgcp_radiografia_proveedor` | Perfil completo de una empresa: ficha, inhabilitaciones, rubros, todos sus contratos, clientes principales y tasa de éxito (procesos ganados / ofertados). |
+| `dgcp_scorecard_institucion` | Cómo compra y paga una institución: plazos de pago frente al máximo legal de 30 días, concentración de proveedores (HHI), cumplimiento de la cuota MIPYME y procesos con plazo de convocatoria inferior al mínimo legal. |
+| `dgcp_calculadora_legal` | Modalidad y plazo mínimo según el monto, umbrales 2026, garantías, anticipo y reglas MIPYME, y si la modalidad usada es inferior a la legal. |
+
+### Preparación de ofertas y defensa
+| Herramienta | Qué hace |
+|---|---|
+| `dgcp_generador_propuesta_sncc` | Borradores de carta de presentación, declaración jurada (Arts. 38-39 Ley 47-25), oferta económica con ITBIS, garantías y checklist, con los datos reales del proceso. |
+| `dgcp_simulador_puntuacion` | Escenarios de precio con la fórmula de proporcionalidad inversa y recomendación según tu margen mínimo. |
+| `dgcp_auditoria_colusion` | Cruza cada oferente de un proceso con su ficha RPE y con la lista de inhabilitados: teléfonos, correos, dominios, domicilios o contactos compartidos, ofertas idénticas, empresas recién creadas. |
+| `dgcp_auditor_pliego_trampa` | Marcas sin equivalencia, exclusividades, criterios subjetivos y plazos insuficientes; redacta la solicitud de aclaración (Art. 102). |
+| `dgcp_generador_recurso_impugnacion` | Recurso de reconsideración (Arts. 204-205) o jerárquico impropio ante la DGCP (Arts. 207-208), con cálculo del vencimiento y medida cautelar opcional (Art. 211). |
+
+Las herramientas jurídicas son asistencia técnica: el resultado debe revisarlo un abogado.
+
+---
+
+## Instalación
+
+Requisitos: Node.js 20 o superior.
 
 ```bash
-# 1. Clonar el repositorio
 git clone https://github.com/edwin042331-hue/dgcp-mcp-server.git
 cd dgcp-mcp-server
-
-# 2. Instalar dependencias y compilar
-npm install
+npm ci
 npm run build
-
-# 3. Probar las pruebas unitarias
-npm test
 ```
 
----
+En Windows, `instalar.ps1` hace todo lo anterior, prueba la conexión con la API y registra el servidor en Claude Desktop y Gemini CLI:
 
-## 🔌 Configuración en tu Asistente de IA
+```powershell
+powershell -ExecutionPolicy Bypass -File .\instalar.ps1
+```
 
-### Para Claude Desktop:
-Edita tu archivo `claude_desktop_config.json`:
-- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
-- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+### Claude Code
+```bash
+claude mcp add dgcp -- node /ruta/absoluta/dgcp-mcp-server/dist/index.js
+```
 
+### Claude Desktop, Cursor, Gemini CLI y otros clientes
 ```json
 {
   "mcpServers": {
     "dgcp": {
       "command": "node",
-      "args": ["RUTA_ABSOLUTA_A/dgcp-mcp-server/dist/index.js"]
+      "args": ["/ruta/absoluta/dgcp-mcp-server/dist/index.js"]
     }
   }
 }
 ```
+Claude Desktop: `%APPDATA%\Claude\claude_desktop_config.json` (Windows) o `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS).
 
-### Para Gemini CLI / Antigravity / Cursor:
-Agrega la entrada en tu archivo `mcp_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "dgcp": {
-      "command": "node",
-      "args": ["RUTA_ABSOLUTA_A/dgcp-mcp-server/dist/index.js"]
-    }
-  }
-}
-```
+### Variables de entorno (opcionales)
+| Variable | Default | Uso |
+|---|---|---|
+| `DGCP_PETICIONES_POR_MINUTO` | 120 | Tope propio de seguridad; además se pausa si la API avisa que quedan ≤3 peticiones. |
+| `DGCP_CONCURRENCIA` | 6 | Peticiones simultáneas máximas. |
+| `DGCP_TIMEOUT_MS` | 35000 | Timeout por intento HTTP. |
+| `DGCP_REINTENTOS` | 3 | Reintentos ante 429, 5xx y errores de red. |
+| `DGCP_CACHE_TTL_MS` | 600000 | Vida de la caché (los datos cambian 4 veces al día). |
+| `DGCP_CACHE_MAX_MB` | 96 | Tope de memoria de la caché. |
+| `DGCP_MAX_PAGINAS` | 6 | Páginas de 1000 registros por consulta. |
 
 ---
 
-## 🖥️ Inspección Visual Interactiva con MCP Inspector v2
+## Frescura de los datos
 
-Puedes explorar de manera gráfica los esquemas Zod y probar cada herramienta directamente en tu navegador:
+La API de la DGCP se alimenta de un Data Warehouse que se actualiza **a las 00:00, 07:00, 14:00 y 21:00 (hora RD)**. Lo publicado en el portal transaccional después del último corte aparece en el siguiente. Cada respuesta indica el corte vigente y el próximo, para que nunca se confunda ese desfase con un error.
+
+## Cómo funciona por dentro
+
+- **Filtros del servidor.** La API sí filtra por código de proceso, RPE, RNC, unidad de compra, estado, MIPYME y fechas; el servidor los usa en vez de descargar páginas a ciegas, y declara la cobertura de cada respuesta ("100% de 686 procesos").
+- **Hora de República Dominicana.** La API rotula sus fechas con `Z` (UTC) pero son hora local RD. Interpretarlas como UTC adelanta cada cierre 4 horas; aquí se corrige en un solo lugar (`src/utils/fechas.ts`).
+- **Resiliencia.** Limitador de tasa adaptativo (ventana deslizante, concurrencia acotada y pausa según `x-ratelimit-remaining`), reintentos con backoff exponencial y jitter que respetan `Retry-After`, deduplicación de peticiones idénticas en vuelo, caché LRU acotada por bytes, presupuestos de tiempo para herramientas pesadas y errores devueltos al modelo con `isError` y una sugerencia accionable.
+- **Normativa verificada.** `src/normativa.ts` concentra cada umbral, plazo y porcentaje, cada uno atado al artículo que lo establece en los textos oficiales.
+
+Detalle técnico de la API y sus particularidades: [docs/API-DGCP.md](docs/API-DGCP.md).
+
+## Desarrollo
 
 ```bash
-npm run inspect
+npm run check        # typecheck + pruebas unitarias (sin red)
+npm run smoke:live   # compila y ejecuta las 17 herramientas contra la API real
+npm run inspect      # MCP Inspector en el navegador
 ```
 
-Abre automáticamente la consola interactiva oficial del Model Context Protocol en `http://localhost:5173`.
+Las pruebas unitarias simulan `fetch` y el reloj: no dependen de la red ni de la hora. La prueba en vivo (`scripts/smoke-live.mjs`) sirve para validar cambios contra la API real antes de publicar.
 
----
+Guía de contribución: [CONTRIBUTING.md](CONTRIBUTING.md). Cambios por versión: [CHANGELOG.md](CHANGELOG.md).
 
-## 🧪 Pruebas Unitarias Automatizadas (Vitest)
+## Licencia y aviso
 
-La suite cuenta con 17 pruebas unitarias de grado industrial que verifican:
-- Filtro estricto de fechas (procesos vencidos hace pocas horas no aparecen como abiertos).
-- Sanitización de caracteres mal codificados (UTF-8 / Latin-1).
-- Umbrales normativos de la Ley 340-06 y Resoluciones anuales DGCP.
-- Algoritmo matemático de puntuación económica.
-
-```bash
-npm test
-```
-
----
-
-## 🤝 Cómo Contribuir (Comunidad Dominicana)
-
-¡Las contribuciones de desarrolladores, investigadores y ciudadanos son bienvenidas!
-La rama `main` está protegida; todas las mejoras se gestionan vía **Pull Request**:
-1. Haz un **Fork** de este repositorio.
-2. Crea tu rama descriptiva (`git checkout -b feature/nueva-herramienta`).
-3. Agrega tus pruebas correspondientes en `tests/` y confirma que `npm test` pase en verde.
-4. Envía tu **Pull Request**.
-
-Consulta nuestra guía completa en [CONTRIBUTING.md](CONTRIBUTING.md).
-
----
-
-## ⚖️ Licencia y Aviso Legal
-Este proyecto está licenciado bajo la **Licencia MIT** - consulta [LICENSE](LICENSE) para más detalles.
-
-*Aviso de Responsabilidad: Este software es una iniciativa independiente y abierta de transparencia de datos cívicos. Los análisis, dictámenes y cálculos generados constituyen asistencia técnica informativa automatizada basada en datos públicos y normativa vigente. Requieren revisión humana y no sustituyen las resoluciones formales de los Comités de Compras y Contrataciones ni de la Dirección General de Contrataciones Públicas (DGCP).*
+MIT. Iniciativa independiente de transparencia con datos públicos; no está afiliada a la DGCP. Los análisis, cálculos y borradores son asistencia técnica automatizada: no sustituyen el pliego de condiciones, las decisiones de los comités de contrataciones ni la asesoría legal.

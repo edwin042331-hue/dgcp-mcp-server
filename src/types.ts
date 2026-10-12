@@ -1,6 +1,9 @@
 // src/types.ts
+// Campos verificados contra la API real (datosabiertos.dgcp.gob.do/api-dgcp/v1).
+// Todas las fechas vienen en hora de Republica Dominicana aunque traigan sufijo "Z"
+// (ver utils/fechas.ts).
 
-/** Campos verificados contra la API real (endpoint /procesos). */
+/** /procesos */
 export interface ProcesoReal {
   codigo_proceso?: string;
   codigo_unidad_compra?: number;
@@ -30,10 +33,13 @@ export interface ProcesoReal {
   numero_proveedores_notificados?: string;
   duracion_contrato?: string;
   url?: string;
+  adquisicion_planeada?: string;
+  compra_verde?: string;
+  compra_conjunta?: string;
   [k: string]: unknown;
 }
 
-/** Campos verificados contra la API real (endpoint /contratos). */
+/** /contratos */
 export interface ContratoReal {
   codigo_contrato?: string;
   codigo_proceso?: string;
@@ -54,7 +60,7 @@ export interface ContratoReal {
   [k: string]: unknown;
 }
 
-/** Campos verificados contra la API real (endpoint /ofertas). */
+/** /ofertas */
 export interface OfertaReal {
   id_oferta?: string;
   codigo_proceso?: string;
@@ -65,7 +71,7 @@ export interface OfertaReal {
   nombre_oferta?: string;
   valor_oferta?: number;
   estado_oferta?: string;
-  estado_evaluacion?: string;
+  estado_evaluacion?: string | null;
   tipo_oferta?: string;
   fecha_creacion?: string;
   fecha_entrega_oferta?: string;
@@ -73,7 +79,7 @@ export interface OfertaReal {
   [k: string]: unknown;
 }
 
-/** Campos verificados contra la API real (endpoint /proveedores). */
+/** /proveedores */
 export interface ProveedorReal {
   rpe?: number | string;
   razon_social?: string;
@@ -113,7 +119,111 @@ export interface ProveedorReal {
   [k: string]: unknown;
 }
 
-export type RegistroGenerico = Record<string, unknown>;
+/** /proveedores/rubro */
+export interface RubroProveedor {
+  rpe?: number;
+  razon_social?: string;
+  familia_unspsc?: string;
+  descripcion?: string;
+}
+
+/** /procesos/articulos */
+export interface ArticuloProceso {
+  codigo_proceso?: string;
+  fecha_publicacion?: string;
+  familia_unspsc?: string;
+  clase_unspsc?: string;
+  subclase_unspsc?: string;
+  descripcion_articulo?: string;
+  cuenta_presupuestaria?: string;
+  descripcion_usuario?: string;
+  cantidad?: number;
+  unidad_medida?: string;
+  precio_unitario_estimado?: number;
+  precio_total_estimado?: number;
+}
+
+/** /contratos/articulos */
+export interface ArticuloContrato {
+  codigo_contrato?: string;
+  codigo_proceso?: string;
+  familia?: string;
+  clase?: string;
+  subclase?: string;
+  cuenta_presupuestaria?: string;
+  descripcion_articulo?: string;
+  descripcion_usuario?: string;
+  unidad_medida?: string;
+  cantidad?: number;
+  precio_unitario?: number;
+  itbis?: number;
+  otros_impuestos?: number;
+  descuentos?: number;
+  costo_total?: number;
+  fecha_creacion_contrato?: string;
+}
+
+/** /procesos/documentos */
+export interface DocumentoProceso {
+  nombre_documento?: string;
+  codigo_proceso?: string;
+  tipo_documento?: string;
+  fecha_carga_archivo?: string;
+  url_documento?: string;
+}
+
+/** /unidades_compra */
+export interface UnidadCompra {
+  codigo_unidad_compra: number;
+  unidad_compra?: string;
+  acronimo?: string;
+  tipo?: string;
+  estado?: string;
+  direccion?: string;
+  telefono?: string;
+  correo?: string;
+  [k: string]: unknown;
+}
+
+/** /procesos/mipymes/cuota_institucion */
+export interface CuotaMipyme {
+  monto_adjudicado?: number;
+  adjudicado_mipymes?: number;
+  porcentaje_mipymes?: number;
+  adjudicado_mipymes_mujeres?: number;
+  porcentaje_mipymes_mujeres?: number;
+  año?: number;
+  codigo_unidad_compra?: number;
+  unidad_compra?: string;
+}
+
+/** /pacc/adquisiciones */
+export interface AdquisicionPacc {
+  id_adquisicion?: string;
+  uid_pacc?: string;
+  codigo_unidad_compra?: number;
+  unidad_compra?: string;
+  descripcion?: string;
+  finalidad?: string;
+  fecha_inicio_proceso_compra?: string;
+  objeto_adquisicion?: string;
+  valor_presupuestado?: number;
+  dirigido_mipymes?: string;
+  dirigido_mipymes_mujeres?: string;
+  modalidad_adquisicion?: string;
+  [k: string]: unknown;
+}
+
+/** Fila de /tablas/proveedores?inhabilitados=true (CSV). */
+export interface ProveedorInhabilitado {
+  rpe: string;
+  motivo: string;
+  fecha_inhabilitacion: string;
+  fecha_habilitacion: string;
+  url: string;
+  /** false cuando el motivo es una cancelacion voluntaria a solicitud del propio proveedor. */
+  es_sancion: boolean;
+}
 
 export interface QueryParams {
   [key: string]: string | number | boolean | undefined;
