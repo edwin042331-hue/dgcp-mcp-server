@@ -1,328 +1,308 @@
 // src/tools/quirurgicoTools.ts
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { dgcpGet, dgcpListar } from "../services/dgcpClient.js";
+import { resolverInstitucion } from "../services/catalogos.js";
+import { formatMonto, formatPct, fixEncoding, normalizar, sumar, soloDigitos, contienePalabra, recortar } from "../utils/texto.js";
+import { formatEpochRD, fechaISORD, sumarDias, parseFechaDGCP } from "../utils/fechas.js";
 import {
-  dgcpGetVariasPaginas, formatMonto, truncate, fixEncoding,
-  normalizar, soloFecha, DgcpApiError,
-} from "../services/dgcpClient.js";
-import { TAMANO_PAGINA_API, MAX_RESPONSE_CHARS } from "../constants.js";
-import type { ContratoReal, ProcesoReal } from "../types.js";
+  PLAZO_MAXIMO_PAGO_DIAS, PLAZO_RECURSO_DIAS_HABILES, AVISO_LEGAL, RESERVA_MIPYME, FIN_TRANSICION,
+  regimenAplicable, describirRegimen,
+} from "../normativa.js";
+import { auditarPlazo } from "./inteligenciaTools.js";
+import { texto, seguro, pie, SOLO_LECTURA, CALCULO_LOCAL } from "./comun.js";
+import type { ContratoReal, ProcesoReal, CuotaMipyme, ArticuloProceso, DocumentoProceso } from "../types.js";
 
-// ============================================================================
-// 1. TOOL: dgcp_scorecard_institucion (Auditoría de Liquidez y Riesgo de Pago)
-// ============================================================================
+/** Dias de plazo de pago a partir del texto de la API ("60 dias", "No especificado"). */
+export function diasDePago(plazo: unknown): number | null {
+  const m = /(\d+)/.exec(normalizar(plazo));
+  return m ? Number(m[1]) : null;
+}
+
+/** Indice Herfindahl-Hirschman (0-10,000) sobre participaciones de mercado. */
+export function hhi(montos: number[]): number {
+  const total = montos.reduce((s, x) => s + x, 0);
+  if (total <= 0) return 0;
+  return Math.round(montos.reduce((s, x) => s + ((x / total) * 100) ** 2, 0));
+}
+
+/** Suma n dias habiles (lunes a viernes) a una fecha YYYY-MM-DD. No descuenta feriados. */
+export function sumarDiasHabiles(fechaISO: string, n: number): string {
+  let d = fechaISO;
+  let restantes = n;
+  while (restantes > 0) {
+    d = sumarDias(d, 1);
+    const dow = new Date(`${d}T12:00:00Z`).getUTCDay();
+    if (dow !== 0 && dow !== 6) restantes--;
+  }
+  return d;
+}
+
+const MARCAS = [
+  "cisco", "fortinet", "palo alto", "checkpoint", "sophos", "juniper", "aruba", "ubiquiti", "mikrotik",
+  "microsoft", "oracle", "sap", "vmware", "red hat", "adobe", "autodesk", "kaspersky", "eset", "symantec",
+  "dell", "hp", "hpe", "lenovo", "apple", "asus", "acer", "samsung", "lg", "huawei", "xerox", "epson", "canon",
+  "ricoh", "brother", "kyocera", "toyota", "nissan", "mitsubishi", "hyundai", "kia", "ford", "chevrolet",
+  "caterpillar", "john deere", "carrier", "trane", "daikin", "york", "apc", "eaton", "schneider", "siemens",
+  "philips", "ge", "3m", "honeywell",
+];
+
+export function detectarMarcas(texto: string): string[] {
+  return MARCAS.filter((m) => contienePalabra(texto, m));
+}
+
+const FRASES_SUBJETIVAS = ["a juicio de", "a discrecion", "a criterio del perito", "a satisfaccion de la institucion", "a criterio de la institucion", "segun considere"];
+const FRASES_EXCLUSIVIDAD = ["distribuidor exclusivo", "carta de exclusividad", "representante exclusivo", "unico distribuidor", "distribuidor autorizado exclusivo"];
+
 const ScorecardSchema = z.object({
-  institucion: z.string().describe("Nombre o parte del nombre de la institucion a auditar (ej. 'IDAC', 'Hospital', 'MICM', 'Ayuntamiento')."),
-  paginas: z.number().int().min(1).max(30).optional().default(20)
-    .describe("Paginas de contratos a escanear para calcular la salud de pago (default 20 = 2,000 contratos)"),
+  institucion: z.string().min(2).describe("Nombre, acronimo o codigo de la institucion. Ej: 'MINERD', 'INFOTEP', '141'."),
 }).strict();
 
-type ScorecardInput = z.infer<typeof ScorecardSchema>;
+const PliegoSchema = z.object({
+  codigo_proceso: z.string().min(3).describe("Codigo oficial del proceso."),
+  extracto_pliego: z.string().optional().describe("Texto de clausulas o especificaciones tecnicas del pliego a auditar (copiado del PDF)."),
+}).strict();
+
+const RecursoSchema = z.object({
+  tipo_recurso: z.enum(["reconsideracion", "jerarquico_impropio"]).optional()
+    .describe("'reconsideracion' (default): primer recurso, ante la institucion (Art. 204). 'jerarquico_impropio': contra la decision de la reconsideracion, ante la DGCP (Art. 207)."),
+  codigo_proceso: z.string().min(3).describe("Codigo del proceso."),
+  acto_impugnado: z.string().min(3).describe("Acto que se impugna: 'Acta de adjudicacion No. X', 'Informe de evaluacion', 'Pliego de condiciones'..."),
+  fecha_notificacion: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("Fecha (YYYY-MM-DD) en que se notifico o publico el acto: calcula el vencimiento del plazo."),
+  hechos: z.string().min(10).describe("Relato breve de lo ocurrido y por que perjudica al recurrente."),
+  agravios: z.string().optional().describe("Normas o principios violados, si se conocen."),
+  incluir_medida_cautelar: z.boolean().optional().describe("true = agrega la instancia separada de medida cautelar ante la DGCP (Art. 211)."),
+  empresa_recurrente: z.string().min(2),
+  rnc_recurrente: z.string().min(3),
+  rpe_recurrente: z.string().optional(),
+  representante: z.string().min(3).describe("Representante legal."),
+}).strict();
 
 export function registerQuirurgicoTools(server: McpServer): void {
   server.registerTool("dgcp_scorecard_institucion", {
-    title: "Scorecard de Salud Financiera y Riesgo de Pago Institucional",
-    description: `Audita quirúrgicamente el comportamiento comercial y de pago de cualquier institución del Estado:
-1. Calcula los plazos reales de pago pactados (30, 60, 90 o 120 días).
-2. Determina los métodos de desembolso preferidos (Transferencia Bancaria directa vs Cheque burocrático).
-3. Calcula el Índice de Concentración de Proveedores (si compran a muchas empresas o si el 80% se lo llevan los mismos 2 proveedores).
-4. Asigna un Rating de Solvencia Comercial (A+, A, B, C, D) y recomendaciones para mitigar asfixia financiera o factoring.`,
-    inputSchema: ScorecardSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async (params: ScorecardInput) => {
-    try {
-      const instNorm = normalizar(params.institucion);
-      const contrData = await dgcpGetVariasPaginas<ContratoReal>("contratos", params.paginas, TAMANO_PAGINA_API);
-
-      const contratosInst = contrData.items.filter((c) =>
-        normalizar(c.unidad_compra || "").includes(instNorm)
-      );
-
-      const out: string[] = [
-        `# SCORECARD QUIRÚRGICO DE SALUD FINANCIERA INSTITUCIONAL (DGCP)`,
-        `**Institución Evaluada:** ${params.institucion}`,
-        `**Muestra Analizada:** ${contratosInst.length} contratos recientes adjudicados`,
-        "================================================================================",
-      ];
-
-      if (contratosInst.length === 0) {
-        out.push(
-          `No se localizaron contratos para "${params.institucion}" dentro de la muestra de ${contrData.items.length} contratos analizados.`,
-          `*Sugerencia: Amplía el término de búsqueda o verifica el nombre oficial de la Unidad de Compra.*`,
-        );
-        return { content: [{ type: "text", text: out.join("\n") }] };
-      }
-
-      const totalMonto = contratosInst.reduce((acc, c) => acc + (typeof c.valor_contratado === "number" ? c.valor_contratado : 0), 0);
-      const nombreOficial = fixEncoding(contratosInst[0].unidad_compra || params.institucion);
-
-      // Desglose de plazos de pago
-      const plazosCount = new Map<string, number>();
-      const metodosCount = new Map<string, number>();
-      const proveedoresCount = new Map<string, number>();
-
-      let dias30 = 0;
-      let dias60 = 0;
-      let dias90Mas = 0;
-
-      contratosInst.forEach((c) => {
-        const plazo = fixEncoding(c.plazo_pago_factura || "No especificado").trim();
-        const metodo = fixEncoding(c.metodo_pago || "No especificado").trim();
-        const prov = fixEncoding(c.razon_social || "Anónimo").trim();
-
-        plazosCount.set(plazo, (plazosCount.get(plazo) ?? 0) + 1);
-        metodosCount.set(metodo, (metodosCount.get(metodo) ?? 0) + 1);
-        proveedoresCount.set(prov, (proveedoresCount.get(prov) ?? 0) + (typeof c.valor_contratado === "number" ? c.valor_contratado : 0));
-
-        const pNorm = normalizar(plazo);
-        if (pNorm.includes("30") || pNorm.includes("15") || pNorm.includes("inmediato")) dias30++;
-        else if (pNorm.includes("60") || pNorm.includes("45")) dias60++;
-        else if (pNorm.includes("90") || pNorm.includes("120")) dias90Mas++;
-        else dias60++; // default conservador
-      });
-
-      // Calificación de Rating
-      const pct30 = (dias30 / contratosInst.length) * 100;
-      const pct90 = (dias90Mas / contratosInst.length) * 100;
-      const tieneTransferencia = Array.from(metodosCount.keys()).some((m) => normalizar(m).includes("transferencia"));
-
-      let rating = "B (Riesgo Moderado)";
-      let recomendacionFinanciera = "";
-
-      if (pct30 >= 60 && tieneTransferencia) {
-        rating = "🟢 A+ (Solvencia Óptima / Pago Rápido)";
-        recomendacionFinanciera = "Institución de alta confiabilidad. Ideal para MIPYMES con bajo capital; paga a tiempo vía transferencia sin necesidad de factoring costoso.";
-      } else if (pct90 >= 30) {
-        rating = "🔴 C (Riesgo Alto de Ilíquidez / Pago Lento)";
-        recomendacionFinanciera = "ALERTA: Esta institución dilata pagos a 90 o 120 días. Si ofertas, DEBES incorporar el costo financiero del dinero (5% a 8%) en tu Sobre B o prever una línea de factoring.";
-      } else {
-        rating = "🟡 B+ (Riesgo Controlado / 45-60 Días)";
-        recomendacionFinanciera = "Comportamiento estándar de la administración pública. Flujo predecible a 60 días. Requiere colchón de liquidez básico.";
-      }
-
-      out.push(
-        `## 1. Dictamen de Calificación Crediticia`,
-        `- **Nombre Oficial en Portal:** ${nombreOficial}`,
-        `- **Calificación Asignada:** **${rating}**`,
-        `- **Volumen Adjudicado Muestreado:** ${formatMonto(totalMonto)} (${contratosInst.length} contratos)`,
-        `- **Ticket Promedio por Contrato:** ${formatMonto(totalMonto / contratosInst.length)}`,
-        `- **Recomendación Estratégica:** ${recomendacionFinanciera}`,
-        "",
-        `## 2. Anatomía de Tiempos y Métodos de Desembolso`,
-        `- **Pagos Ágiles (≤ 30 días):** ${dias30} contratos (${pct30.toFixed(1)}%)`,
-        `- **Pagos Medios (45 a 60 días):** ${dias60} contratos (${((dias60 / contratosInst.length) * 100).toFixed(1)}%)`,
-        `- **Pagos Lentos (≥ 90 días):** ${dias90Mas} contratos (${pct90.toFixed(1)}%)`,
-        "",
-        `### Métodos de Pago Empleados:`,
-      );
-
-      metodosCount.forEach((cant, met) => {
-        out.push(`   - **${met}:** ${cant} contratos (${((cant / contratosInst.length) * 100).toFixed(1)}%)`);
-      });
-
-      out.push("", `## 3. Índice de Apertura vs. Concentración de Proveedores`);
-      const provsOrdenados = Array.from(proveedoresCount.entries()).sort((a, b) => b[1] - a[1]);
-      const top3Monto = provsOrdenados.slice(0, 3).reduce((acc, p) => acc + p[1], 0);
-      const pctConcentracion = totalMonto > 0 ? (top3Monto / totalMonto) * 100 : 0;
-
-      out.push(
-        `- **Total de Proveedores Distintos Contratados:** ${proveedoresCount.size}`,
-        `- **Concentración en los 3 Mayores Suplidores:** ${pctConcentracion.toFixed(1)}% del presupuesto muestreado.`,
-        pctConcentracion > 65
-          ? `  *(⚠️ ALERTA: Alta concentración de adjudicaciones en pocos proveedores. Requiere propuesta agresiva en precio para romper la inercia).*`
-          : `  *(✅ ENTORNO COMPETITIVO: La institución diversifica sus compras y da apertura real a nuevos oferentes).*`,
-        "",
-        `### Top 3 Suplidores con Mayor Facturación en la Entidad:`,
-      );
-
-      provsOrdenados.slice(0, 3).forEach(([prov, monto], i) => {
-        out.push(`   ${i + 1}. **${prov}:** ${formatMonto(monto)} (${totalMonto > 0 ? ((monto / totalMonto) * 100).toFixed(1) : 0}%)`);
-      });
-
-      return { content: [{ type: "text", text: truncate(out.join("\n"), MAX_RESPONSE_CHARS) }] };
-    } catch (err) {
-      if (err instanceof DgcpApiError) {
-        return { content: [{ type: "text", text: `Error en scorecard institucional: ${err.message}` }] };
-      }
-      throw err;
+    title: "Scorecard de una institucion compradora (DGCP)",
+    description: `Perfil exacto de como compra y paga una institucion (filtro por su codigo oficial de unidad de compra):
+- Plazos de pago pactados frente al maximo legal de 30 dias (Art. 148 P. III Ley 47-25) y metodo de pago.
+- Concentracion de proveedores: top 5 y HHI.
+- Cumplimiento de la cuota MIPYME del ano (dato oficial DGCP).
+- Mezcla de modalidades (peso de excepciones y compras directas) y auditoria de plazos de convocatoria de sus procesos recientes (Art. 101).`,
+    inputSchema: ScorecardSchema.shape,
+    annotations: SOLO_LECTURA,
+  }, seguro("Error en el scorecard institucional", async ({ institucion }: z.infer<typeof ScorecardSchema>) => {
+    const unidades = await resolverInstitucion(institucion);
+    if (unidades.length === 0) return texto(`No se encontro ninguna unidad de compra para "${institucion}". Prueba con el acronimo o parte del nombre oficial.`);
+    if (unidades.length > 1) {
+      return texto(`"${institucion}" coincide con ${unidades.length} unidades de compra. Repite con el codigo exacto:\n` +
+        unidades.slice(0, 20).map((u) => `- ${u.codigo_unidad_compra}: ${u.unidad_compra}${u.acronimo ? ` (${u.acronimo})` : ""}`).join("\n"));
     }
-  });
-
-  // ============================================================================
-  // 2. TOOL: dgcp_auditor_pliego_trampa (Detección de Pliegos "Traje a la Medida")
-  // ============================================================================
-  const TrampaSchema = z.object({
-    codigo_proceso: z.string().describe("Codigo oficial del proceso en la DGCP (ej. 'MICM-CCC-LPN-2026-0007')."),
-    extracto_pliego: z.string().optional()
-      .describe("Texto, clausula o requerimiento del pliego de condiciones que sospechas que esta amarrado o dirigido."),
-  }).strict();
-
-  type TrampaInput = z.infer<typeof TrampaSchema>;
-
-  server.registerTool("dgcp_auditor_pliego_trampa", {
-    title: "Auditor Forense de Pliegos: Detección de Cláusulas Trampa y Amarres",
-    description: `Analiza si un pliego de condiciones contiene especificaciones ilegales o dirigidas a un único proveedor:
-1. Detecta violación al Artículo 21 de la Ley 340-06 (inclusión de marcas o patentes sin la frase "o su equivalente técnico").
-2. Detecta exigencias desproporcionadas de experiencia que violan el Principio de Razonabilidad (Art. 3 Ley 340-06).
-3. Identifica subcriterios subjetivos ("a satisfacción del perito") prohibidos por la DGCP.
-4. Redacta de forma automática la Solicitud Formal de Aclaración y Enmienda de Pliego para obligar a la institución a abrir la competencia.`,
-    inputSchema: TrampaSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async (params: TrampaInput) => {
-    try {
-      const codNorm = normalizar(params.codigo_proceso);
-      const procData = await dgcpGetVariasPaginas<ProcesoReal>("procesos", 8, TAMANO_PAGINA_API);
-      const proceso = procData.items.find((p) => normalizar(p.codigo_proceso) === codNorm);
-
-      const textoAuditado = (params.extracto_pliego || "") + " " + (proceso?.descripcion || "") + " " + (proceso?.titulo || "");
-      const textoNorm = normalizar(textoAuditado);
-
-      const hallazgos: string[] = [];
-
-      // Banderas de auditoría
-      const marcasConocidas = ["cisco", "fortinet", "palo alto", "microsoft", "oracle", "dell", "hp", "lenovo", "xerox", "epson"];
-      const marcasDetectadas = marcasConocidas.filter((m) => textoNorm.includes(m));
-
-      if (marcasDetectadas.length > 0) {
-        const tieneEquivalente = textoNorm.includes("equivalente") || textoNorm.includes("o similar");
-        if (!tieneEquivalente) {
-          hallazgos.push(
-            `🚩 **VIOLACIÓN DIRECTA AL ARTÍCULO 21 LEY 340-06:** Se detectó la mención explícita de marcas comerciales (**${marcasDetectadas.join(", ").toUpperCase()}**) SIN la cláusula obligatoria *"o su equivalente funcional/técnico"*. Esto constituye causal de impugnación por direccionamiento ilícito.`
-          );
-        } else {
-          hallazgos.push(
-            `ℹ️ **Mención de Marca con Salvedad Legal:** Se mencionan marcas (${marcasDetectadas.join(", ").toUpperCase()}), pero se incluyó la salvedad de equivalencia. Se debe verificar que las especificaciones no sean exclusivas de esa arquitectura.`
-          );
-        }
-      }
-
-      if (textoNorm.includes("a juicio de") || textoNorm.includes("a discrecion") || textoNorm.includes("a criterio del perito")) {
-        hallazgos.push(
-          `🚩 **CRITERIO SUBJETIVO DISCRECIONAL (PROHIBIDO):** Se detectaron frases de ponderación subjetiva. La DGCP prohíbe puntajes basados en apreciaciones personales no cuantificables matemáticamente.`
-        );
-      }
-
-      if (textoNorm.includes("certificacion de distribuidor exclusivo") || textoNorm.includes("carta de exclusividad")) {
-        hallazgos.push(
-          `🚩 **BARRERA ARTIFICIAL DE ENTRADA:** La exigencia de exclusividad en un proceso ordinario bloquea la libre concurrencia (Art. 3 Ley 340-06). Solo se admite en Contratación Directa por Proveedor Único justificada técnicamente.`
-        );
-      }
-
-      const out = [
-        `# AUDITORÍA QUIRÚRGICA DE PLIEGO DE CONDICIONES (LEY 340-06)`,
-        `**Proceso:** ${params.codigo_proceso}`,
-        `**Institución:** ${proceso?.unidad_compra ? fixEncoding(proceso.unidad_compra) : "Institución Contratante"}`,
-        `**Objeto:** ${proceso?.titulo ? fixEncoding(proceso.titulo) : "Proceso de Licitación"}`,
-        "================================================================================",
-        "",
-        `## 1. Diagnóstico de Legalidad y Banderas Rojas`,
-      ];
-
-      if (hallazgos.length > 0) {
-        hallazgos.forEach((h) => out.push(h, ""));
-      } else {
-        out.push(
-          `✅ **Pliego Aparentemente Conforme:** No se detectaron patrones típicos de amarre en la descripción general.`,
-          `- Si tienes una cláusula puntual del documento PDF que consideres restrictiva, ingrésala en el parámetro 'extracto_pliego' para emitir dictamen específico.`,
-          "",
-        );
-      }
-
-      out.push(
-        `## 2. Minuta Legal de Solicitud de Aclaración y Enmienda (Lista para someter)`,
-        `*Esta solicitud debe cargarse en la sección "Consultas y Respuestas" del Portal Transaccional antes de que venza el período de aclaraciones:*`,
-        "",
-        `**A:** Comité de Compras y Contrataciones`,
-        `**Referencia:** Proceso No. ${params.codigo_proceso}`,
-        `**Asunto:** Solicitud de aclaración y enmienda técnica en virtud de los Artículos 3 y 21 de la Ley 340-06`,
-        "",
-        `Distinguidos Miembros del Comité:`,
-        `En atención al principio de **Libre Competencia, Igualdad y Participación** consagrado en el Artículo 3 de la Ley No. 340-06, solicitamos formalmente aclarar y enmendar las especificaciones técnicas del presente proceso:`,
-        "",
-        `1. Solicitar la confirmación expresa de que, de conformidad con el **Artículo 21 de la Ley 340-06**, serán admitidas todas aquellas propuestas que ofrezcan bienes o soluciones de tecnología que cumplan con la **equivalencia funcional y técnica**, sin que la mención de marcas comerciales de referencia constituya una causal de exclusión o descalificación.`,
-        `2. Enmendar cualquier cláusula restrictiva que limite la participación de canales autorizados independientes o MIPYMES acreditadas en el RPE.`,
-        "",
-        `Agradeciendo de antemano su pronta atención en pro de la transparencia de las compras públicas.`,
-      );
-
-      return { content: [{ type: "text", text: truncate(out.join("\n"), MAX_RESPONSE_CHARS) }] };
-    } catch (err) {
-      if (err instanceof DgcpApiError) {
-        return { content: [{ type: "text", text: `Error al auditar pliego: ${err.message}` }] };
-      }
-      throw err;
-    }
-  });
-
-  // ============================================================================
-  // 3. TOOL: dgcp_generador_recurso_impugnacion (Defensa Jurídica ante la DGCP)
-  // ============================================================================
-  const RecursoSchema = z.object({
-    codigo_proceso: z.string().describe("Codigo oficial del proceso licitado."),
-    acto_atacado: z.string().describe("Acto que se impugna (ej. 'Acta de Adjudicación No. XX', 'Pliego de Condiciones', 'Acta de Descalificación Técnica')."),
-    motivo_agravio: z.string().describe("Causal de violación (ej. 'Descalificación arbitraria habiendo cumplido ficha técnica', 'Adjudicación a empresa con precio superior sin justificación', 'Colusión demostrada entre oferentes')."),
-    empresa_recurrente: z.string().describe("Nombre de tu empresa que somete el recurso."),
-    rnc_recurrente: z.string().describe("RNC de tu empresa."),
-    representante: z.string().describe("Nombre del representante legal."),
-  }).strict();
-
-  type RecursoInput = z.infer<typeof RecursoSchema>;
-
-  server.registerTool("dgcp_generador_recurso_impugnacion", {
-    title: "Generador de Recurso de Impugnación y Medida Cautelar ante la DGCP",
-    description: `Redacta un Recurso Jerárquico formal con Solicitud de Medida Cautelar de Suspensión de Oficio ante la DGCP:
-1. Fundamentado en la Ley 340-06, Decreto 543-12, Ley 107-13 sobre Procedimiento Administrativo y jurisprudencia del TSA.
-2. Contiene estructura jurídica formal de tribunal: Calidad, Hechos, Derecho, Agravios y Petitorio formal.
-3. Solicita la suspensión inmediata del proceso o contrato para evitar la consumación de daños irreparables.`,
-    inputSchema: RecursoSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async (params: RecursoInput) => {
-    const fecha = new Date().toLocaleDateString("es-DO", { year: "numeric", month: "long", day: "numeric" });
+    const u = unidades[0];
+    const anio = Number(fechaISORD().slice(0, 4));
+    const [contratos, procesos, cuota] = await Promise.all([
+      dgcpListar<ContratoReal>("contratos", { unidad_compra: u.codigo_unidad_compra }, { maxPaginas: 2 }),
+      dgcpListar<ProcesoReal>("procesos", { unidad_compra: u.codigo_unidad_compra }, { maxPaginas: 1 }),
+      dgcpGet<{ payload?: { content?: CuotaMipyme[] } | CuotaMipyme[] }>("procesos/mipymes/cuota_institucion", { unidad_compra: u.codigo_unidad_compra, "año": anio }).catch(() => null),
+    ]);
 
     const out = [
-      `# RECURSO FORMAL DE IMPUGNACIÓN Y SOLICITUD DE MEDIDA CAUTELAR (DGCP)`,
-      `**Sometido por:** ${params.empresa_recurrente} (RNC: ${params.rnc_recurrente})`,
-      `**Proceso Afectado:** ${params.codigo_proceso}`,
-      `**Acto Impugnado:** ${params.acto_atacado}`,
-      `**Fecha:** ${fecha}`,
-      "================================================================================",
-      "",
-      `**AL:** Director General de la Dirección General de Contrataciones Públicas (DGCP)`,
-      `**Y AL:** Comité de Compras y Contrataciones de la Institución Convocante`,
-      "",
-      `**ASUNTO:** FORMAL RECURSO ADMINISTRATIVO DE IMPUGNACIÓN CONTRA ${params.acto_atacado.toUpperCase()} Y SOLICITUD DE MEDIDA CAUTELAR DE SUSPENSIÓN DE OFICIO DEL PROCESO No. ${params.codigo_proceso}.`,
-      "",
-      `**RECURRENTE:** La sociedad comercial **${params.empresa_recurrente}**, RNC No. **${params.rnc_recurrente}**, representada por su Representante Legal, **${params.representante}**.`,
-      "",
-      `Distinguidas Autoridades:`,
-      "",
-      `### I. DE LA CALIDAD Y EL PLAZO LEGAL`,
-      `La recurrente ostenta calidad jurídica plena en virtud de su condición de oferente formal debidamente inscrito en el Registro de Proveedores del Estado (RPE) y participante habilitado en el proceso de referencia. El presente recurso se interpone dentro del plazo legal improrrogable establecido por el **Artículo 67 de la Ley No. 340-06** y los plazos de la **Ley No. 107-13** sobre los Derechos de las Personas en sus Relaciones con la Administración.`,
-      "",
-      `### II. RELACIÓN DE LOS HECHOS Y AGRAVIOS`,
-      `1. En fecha reciente, la entidad contratante emitió el acto administrativo consistente en **"${params.acto_atacado}"**, mediante el cual se lesionan los derechos e intereses legítimos de nuestra representada.`,
-      `2. **MOTIVO ESPECÍFICO DEL AGRAVIO:** ${params.motivo_agravio}.`,
-      `3. Dicha decisión transgrede de manera flagrante los principios rectores de **Igualdad, Libre Competencia, Transparencia y Debido Proceso Administrativo** contemplados en el Artículo 3 de la Ley 340-06, así como la debida motivación que exige el Artículo 3 de la Ley 107-13.`,
-      "",
-      `### III. PETITORIO DE MEDIDA CAUTELAR (SUSPENSIÓN INMEDIATA)`,
-      `Existe un evidente *Fumus Boni Iuris* (apariencia de buen derecho) y un manifiesto *Periculum in Mora* (peligro en la demora), toda vez que de continuarse con la firma o ejecución del contrato derivado de este acto viciado, se consumaría un daño irreparable tanto al patrimonio público como a los derechos adquiridos de la recurrente.`,
-      "",
-      `**POR TALES MOTIVOS**, y los que oportunamente se expondrán, solicitamos muy respetuosamente:`,
-      "",
-      `**PRIMERO:** Declarar **BUENO Y VÁLIDO**, en cuanto a la forma, el presente Recurso de Impugnación por haber sido interpuesto en tiempo hábil y con apego a las disposiciones de la Ley No. 340-06 y la Ley No. 107-13.`,
-      `**SEGUNDO:** Ordenar como **MEDIDA CAUTELAR DE URGENCIA** la **SUSPENSIÓN INMEDIATA** de todos los efectos jurídicos del proceso No. **${params.codigo_proceso}**, absteniéndose la institución de suscribir contrato o librar órdenes de pago hasta tanto la DGCP emita su resolución definitiva.`,
-      `**TERCERO:** En cuanto al fondo, **REVOCAR Y ANULAR** en todas sus partes el acto consistente en **"${params.acto_atacado}"**, ordenando la reevaluación objetiva de las propuestas conforme a derecho y adjudicando a quien en estricta justicia corresponda.`,
-      "",
-      `BAJO LAS MÁS AMPLIAS RESERVAS DE DERECHO Y ACCIÓN.`,
-      "",
-      `___________________________________________________________`,
-      `**${params.representante}**`,
-      `Por: **${params.empresa_recurrente}**`,
-      "",
-      `---`,
-      `*Aviso de Responsabilidad Legal: Este documento es una minuta preliminar generada por una herramienta de asistencia técnica. Conforme a la legislación procesal dominicana y la Ley 91 sobre el Colegio de Abogados, todo recurso administrativo ante la DGCP o el Tribunal Superior Administrativo (TSA) debe ser revisado, validado y rubricado por un profesional del derecho autorizado.*`
+      `# Scorecard: ${fixEncoding(u.unidad_compra ?? "")} (cod. ${u.codigo_unidad_compra}${u.acronimo ? `, ${u.acronimo}` : ""})`,
+      `Contratos analizados: ${contratos.items.length.toLocaleString("en-US")} de ${contratos.total.toLocaleString("en-US")} (los mas recientes). Procesos analizados: ${procesos.items.length.toLocaleString("en-US")} de ${procesos.total.toLocaleString("en-US")}.`,
     ];
+    const validos = contratos.items.filter((c) => !/cancel/i.test(String(c.estado_contrato)));
+    if (validos.length > 0) {
+      const total = sumar(validos, (c) => c.valor_contratado);
+      const conPlazo = validos.map((c) => diasDePago(c.plazo_pago_factura)).filter((d): d is number => d !== null);
+      // El maximo de 30 dias solo obliga en contratos del regimen nuevo: se mide sobre los adjudicados
+      // despues de la transicion (los procesos convocados antes siguen la Ley 340-06, Art. 245).
+      const corte = Date.parse(`${FIN_TRANSICION}T00:00:00-04:00`);
+      const nuevos = validos.filter((c) => (parseFechaDGCP(c.fecha_adjudicacion) ?? 0) >= corte)
+        .map((c) => diasDePago(c.plazo_pago_factura)).filter((d): d is number => d !== null);
+      const excede = nuevos.filter((d) => d > PLAZO_MAXIMO_PAGO_DIAS).length;
+      const metodos = new Map<string, number>();
+      validos.forEach((c) => metodos.set(fixEncoding(c.metodo_pago ?? "No especificado"), (metodos.get(fixEncoding(c.metodo_pago ?? "No especificado")) ?? 0) + 1));
+      const plazos = new Map<string, number>();
+      validos.forEach((c) => plazos.set(fixEncoding(c.plazo_pago_factura ?? "No especificado"), (plazos.get(fixEncoding(c.plazo_pago_factura ?? "No especificado")) ?? 0) + 1));
+      const prom = conPlazo.length ? conPlazo.reduce((s, x) => s + x, 0) / conPlazo.length : 0;
 
-    return { content: [{ type: "text", text: truncate(out.join("\n"), MAX_RESPONSE_CHARS) }] };
-  });
+      out.push("", "## Pagos",
+        `- Plazo de pago pactado promedio: ${prom.toFixed(0)} dias. Distribucion: ${[...plazos.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}: ${v}`).join(", ")}.`,
+        nuevos.length > 0
+          ? `- Adjudicados desde el ${FIN_TRANSICION} con plazo pactado mayor a ${PLAZO_MAXIMO_PAGO_DIAS} dias: ${excede} de ${nuevos.length} (${formatPct((excede / nuevos.length) * 100)}). La Ley 47-25 obliga a pagar en maximo 30 dias desde que se cumple la condicion de pago y se presenta el requerimiento, con intereses por mora si no (Art. 148 P. III). Verifica en cada caso que el proceso se convoco ya bajo la Ley 47-25.`
+          : `- No hay contratos adjudicados despues del ${FIN_TRANSICION} en la muestra para medir el plazo legal de 30 dias (Art. 148 P. III Ley 47-25).`,
+        `- Metodo de pago: ${[...metodos.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${formatPct((v / validos.length) * 100)}`).join(", ")}.`,
+        `- Calificacion de pago: ${prom <= 30 ? "A (paga en plazo legal)" : prom <= 60 ? "B (60 dias tipicos: prever capital de trabajo)" : "C (pago lento: incluye el costo financiero en tu precio o usa factoring, Art. 174/cesion de credito)"}.`);
+
+      const porProv = new Map<string, { nombre: string; monto: number; n: number }>();
+      for (const c of validos) {
+        const k = soloDigitos(c.rpe) || normalizar(c.razon_social);
+        const e = porProv.get(k) ?? { nombre: fixEncoding(c.razon_social ?? "N/D"), monto: 0, n: 0 };
+        e.monto += c.valor_contratado ?? 0; e.n++;
+        porProv.set(k, e);
+      }
+      const orden = [...porProv.values()].sort((a, b) => b.monto - a.monto);
+      const indice = hhi(orden.map((x) => x.monto));
+      const top3 = orden.slice(0, 3).reduce((s, x) => s + x.monto, 0);
+      out.push("", "## Concentracion de proveedores",
+        `- ${porProv.size} proveedores distintos; monto total ${formatMonto(total)}.`,
+        `- Top 3 concentra ${formatPct(total ? (top3 / total) * 100 : 0)}. HHI = ${indice} (${indice >= 2500 ? "muy concentrado" : indice >= 1500 ? "moderadamente concentrado" : "competitivo"}).`,
+        ...orden.slice(0, 5).map((x, i) => `${i + 1}. ${x.nombre}: ${x.n} contratos, ${formatMonto(x.monto)} (${formatPct(total ? (x.monto / total) * 100 : 0)})`));
+    }
+
+    const c = cuota ? (Array.isArray(cuota.payload) ? cuota.payload : cuota.payload?.content ?? [])[0] : undefined;
+    if (c && typeof c.porcentaje_mipymes === "number") {
+      out.push("", `## Adjudicacion a MIPYMES ${c.año ?? anio} (dato oficial DGCP)`,
+        `- Adjudicado total: ${formatMonto(c.monto_adjudicado)}; a MIPYMES: ${formatMonto(c.adjudicado_mipymes)} (${formatPct(c.porcentaje_mipymes)}); a MIPYMES de mujeres: ${formatPct(c.porcentaje_mipymes_mujeres ?? 0)}.`,
+        `- Referencia legal: el Art. 172 Ley 47-25 obliga a reservar al menos el ${RESERVA_MIPYME.TOTAL_PCT}% de las partidas de contratacion para procedimientos exclusivos de MIPYMES (${RESERVA_MIPYME.GENERAL_PCT}% general y ${RESERVA_MIPYME.MUJERES_PCT}% dirigidas por mujeres). La cifra de arriba mide lo adjudicado a MIPYMES por cualquier via, no la reserva: sirve como indicio, no como prueba de cumplimiento.`);
+    }
+
+    if (procesos.items.length > 0) {
+      const mods = new Map<string, number>();
+      procesos.items.forEach((p) => mods.set(fixEncoding(p.modalidad ?? "N/D"), (mods.get(fixEncoding(p.modalidad ?? "N/D")) ?? 0) + 1));
+      const auditados = procesos.items.map((p) => ({ p, a: auditarPlazo(p) })).filter((x) => x.a !== null);
+      const incumplen = auditados.filter((x) => x.a!.incumple);
+      out.push("", `## Procesos recientes (${procesos.items.length})`,
+        `- Modalidades: ${[...mods.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${formatPct((v / procesos.items.length) * 100)}`).join(", ")}.`,
+        `- Plazo de convocatoria (Art. 101 Ley 47-25): ${auditados.length} procesos auditables, ${incumplen.length} con menos dias habiles que el minimo legal${incumplen.length > 0 ? " (el conteo no descuenta feriados, asi que esos incumplimientos son ciertos)" : ""}.`);
+      incumplen.slice(0, 8).forEach(({ p, a }) => out.push(`  - ${p.codigo_proceso} (${fixEncoding(p.modalidad ?? "")}): ${a!.habiles} de ${a!.minimo} dias habiles. ${recortar(p.titulo, 70)}`));
+    }
+    out.push("", `_${AVISO_LEGAL}_`);
+    return texto(out.join("\n") + pie());
+  }));
+
+  server.registerTool("dgcp_auditor_pliego_trampa", {
+    title: "Auditor de pliegos dirigidos (DGCP)",
+    description: `Revisa si un proceso tiene senales de pliego dirigido o barreras indebidas:
+- Marcas o nombres comerciales en titulo, articulos o el extracto del pliego (Art. 91 P. II Ley 47-25: prohibidas salvo que no exista otra forma de describir el objeto).
+- Exigencias de exclusividad y criterios subjetivos de evaluacion (Art. 91 P. I: especificaciones que crean obstaculos innecesarios).
+- Plazo de convocatoria inferior al minimo (Art. 101) y fecha limite para pedir aclaraciones (Art. 102).
+Genera la solicitud de aclaracion lista para el buzon del portal. Pega en 'extracto_pliego' las especificaciones del PDF para un analisis completo.`,
+    inputSchema: PliegoSchema.shape,
+    annotations: SOLO_LECTURA,
+  }, seguro("Error auditando el pliego", async ({ codigo_proceso, extracto_pliego }: z.infer<typeof PliegoSchema>) => {
+    const cod = codigo_proceso.trim();
+    const [proc, arts, docs] = await Promise.all([
+      dgcpListar<ProcesoReal>("procesos", { proceso: cod }, { maxPaginas: 1, limite: 5 }),
+      dgcpListar<ArticuloProceso>("procesos/articulos", { proceso: cod }, { maxPaginas: 1 }),
+      dgcpGet<{ payload?: { content?: DocumentoProceso[] | null } }>("procesos/documentos", { proceso: cod }).catch(() => null),
+    ]);
+    const p = proc.items[0];
+    const fuentes = [
+      p?.titulo, p?.descripcion,
+      ...arts.items.map((a) => a.descripcion_usuario),
+      extracto_pliego,
+    ].map((x) => fixEncoding(x ?? "")).join(" \n ");
+    const t = normalizar(fuentes);
+    const hallazgos: string[] = [];
+
+    const marcas = detectarMarcas(fuentes);
+    if (marcas.length > 0) {
+      const equivalente = /(o (su )?equivalente|o similar|equivalente funcional|o superior)/.test(t);
+      hallazgos.push(equivalente
+        ? `Menciona marcas (${marcas.join(", ").toUpperCase()}) con salvedad de equivalencia. Verifica que las especificaciones no sean exclusivas de una marca.`
+        : `**Marcas sin salvedad de equivalencia: ${marcas.join(", ").toUpperCase()}.** El Art. 91 P. II Ley 47-25 prohibe exigir o mencionar marcas salvo que no exista otro medio suficientemente preciso para describir el objeto.`);
+    }
+    const subj = FRASES_SUBJETIVAS.filter((f) => t.includes(f));
+    if (subj.length) hallazgos.push(`**Criterios subjetivos** ("${subj.join('", "')}"): la evaluacion debe ser objetiva y verificable (Art. 91 Ley 47-25).`);
+    const excl = FRASES_EXCLUSIVIDAD.filter((f) => t.includes(f));
+    if (excl.length) hallazgos.push(`**Exigencia de exclusividad** ("${excl.join('", "')}"): restringe la participacion (Art. 91 P. I). La exclusividad solo justifica un procedimiento de excepcion por proveedor unico.`);
+    const exp = /experiencia (minima )?de (\d+) anos/.exec(t);
+    if (exp && Number(exp[2]) >= 5) hallazgos.push(`Exige ${exp[2]} anos de experiencia: valida que sea proporcional al objeto; requisitos excesivos pueden ser un obstaculo innecesario (Art. 91 P. I).`);
+    if (p) {
+      const a = auditarPlazo(p);
+      if (a?.incumple) hallazgos.push(`**Plazo insuficiente:** ${a.habiles} dias habiles entre publicacion y cierre, minimo ${a.minimo} (${a.base}).`);
+    }
+
+    const pub = parseFechaDGCP(p?.fecha_publicacion);
+    const cierre = parseFechaDGCP(p?.fecha_fin_recepcion_ofertas);
+    const limiteAclaracion = pub !== null && cierre !== null ? pub + (cierre - pub) / 2 : null;
+
+    const out = [
+      `# Auditoria de pliego: ${cod}`,
+      p ? `${fixEncoding(p.titulo ?? "").trim()} | ${fixEncoding(p.unidad_compra ?? "")} | ${fixEncoding(p.modalidad ?? "")} | ${formatMonto(p.monto_estimado)}` : "_Proceso no encontrado en /procesos: se audita solo el extracto aportado._",
+      p ? `Regimen: ${describirRegimen(regimenAplicable(p.fecha_publicacion))}` : "",
+      `Texto analizado: titulo, ${arts.items.length} articulos${extracto_pliego ? " y el extracto aportado" : " (sin extracto del pliego: pega las especificaciones para un analisis completo)"}.`,
+      "", "## Hallazgos",
+      ...(hallazgos.length ? hallazgos.map((h) => `- ${h}`) : ["- Sin senales de direccionamiento en el texto disponible."]),
+    ];
+    const docsPliego = (docs?.payload?.content ?? []).filter((d) => /pliego|especificacion|ficha|termino/i.test(`${d.nombre_documento} ${d.tipo_documento}`));
+    if (docsPliego.length) {
+      out.push("", "## Documentos del pliego para revisar", ...docsPliego.slice(0, 8).map((d) => `- ${recortar(d.nombre_documento, 80)}: ${d.url_documento}`));
+    }
+    out.push("", "## Solicitud de aclaracion (para el buzon de consultas del portal)",
+      limiteAclaracion !== null
+        ? `Plazo para enviarla: hasta ${formatEpochRD(limiteAclaracion)} (50% del plazo de ofertas, Art. 102 Ley 47-25).${limiteAclaracion < Date.now() ? " **Ese plazo ya vencio.**" : ""}`
+        : "Plazo: hasta el 50% del periodo de presentacion de ofertas (Art. 102 Ley 47-25).",
+      "",
+      `Senores Comite de Contrataciones Publicas${p ? ` de ${fixEncoding(p.unidad_compra ?? "")}` : ""}:`,
+      "",
+      `Ref.: Procedimiento ${cod}. Solicitud de aclaracion y enmienda del pliego de condiciones (Art. 102 Ley 47-25).`,
+      "",
+      "En virtud del principio de libre competencia y de los Arts. 91 y 102 de la Ley 47-25, solicitamos:",
+      marcas.length ? `1. Confirmar que se admitiran bienes de marcas distintas a ${marcas.join(", ").toUpperCase()} que cumplan una equivalencia funcional y tecnica, o enmendar las especificaciones para describir el objeto de forma objetiva, funcional y generica (Art. 91 P. II).` : "1. Confirmar que las especificaciones tecnicas admiten soluciones equivalentes que cumplan las mismas funciones (Art. 91).",
+      excl.length ? "2. Eliminar la exigencia de exclusividad o de distribuidor unico, por constituir un obstaculo innecesario a la participacion (Art. 91 P. I)." : "2. Precisar los criterios de evaluacion de forma objetiva y verificable, indicando su ponderacion.",
+      "3. Publicar las respuestas y enmiendas en el SECP para conocimiento de todos los interesados.",
+      "", "Atentamente,", "[Nombre del representante] - [Empresa] - RNC [ ] - RPE [ ]",
+      "", `_${AVISO_LEGAL}_`);
+    return texto(out.filter((l) => l !== "").join("\n").replace(/\n(#+ )/g, "\n\n$1") + pie());
+  }));
+
+  server.registerTool("dgcp_generador_recurso_impugnacion", {
+    title: "Generador de recurso administrativo (Ley 47-25)",
+    description: `Redacta el recurso correcto segun la Ley 47-25:
+- Reconsideracion: primero y obligatorio, ante el organo responsable del proceso, en 10 dias habiles (Arts. 204-205).
+- Jerarquico impropio: contra la decision de la reconsideracion, ante la DGCP, en 10 dias habiles (Arts. 207-208).
+- Medida cautelar: instancia separada ante la DGCP mientras el recurso este pendiente (Art. 211); los recursos NO suspenden el acto por si solos (Art. 201).
+Calcula el vencimiento del plazo si se indica la fecha de notificacion. Si el proceso fue convocado bajo la Ley 340-06, lo advierte.`,
+    inputSchema: RecursoSchema.shape,
+    annotations: CALCULO_LOCAL,
+  }, seguro("Error generando el recurso", async (p: z.infer<typeof RecursoSchema>) => {
+    const tipo = p.tipo_recurso ?? "reconsideracion";
+    const proc = await dgcpListar<ProcesoReal>("procesos", { proceso: p.codigo_proceso.trim() }, { maxPaginas: 1, limite: 5 }).catch(() => null);
+    const pr = proc?.items[0];
+    const regimen = regimenAplicable(pr?.fecha_publicacion);
+    const institucion = pr ? fixEncoding(pr.unidad_compra ?? "") : "[Institucion contratante]";
+    const vence = p.fecha_notificacion ? sumarDiasHabiles(p.fecha_notificacion, PLAZO_RECURSO_DIAS_HABILES) : null;
+    const hoy = fechaISORD();
+
+    const out: string[] = [];
+    if (regimen !== "ley_47_25") {
+      out.push(`> **Atencion:** el proceso fue convocado bajo ${describirRegimen(regimen)}. Por el Art. 245 Ley 47-25, sus recursos se rigen por la ley vigente al momento de la convocatoria; adapta este modelo con un abogado.`, "");
+    }
+    if (vence) {
+      out.push(`> **Plazo:** notificado el ${p.fecha_notificacion}; vence el ${vence} (10 dias habiles, sin descontar feriados: si hubo feriados el plazo se extiende).${vence < hoy ? " **SEGUN ESTE CALCULO EL PLAZO YA VENCIO.**" : ""}`, "");
+    }
+    const destinatario = tipo === "reconsideracion"
+      ? `Comite de Contrataciones Publicas / Organo responsable del procedimiento\n${institucion}`
+      : "Direccion General de Contrataciones Publicas (DGCP)";
+    out.push(
+      `# RECURSO DE ${tipo === "reconsideracion" ? "RECONSIDERACION" : "JERARQUICO IMPROPIO"}`,
+      "", `**A:** ${destinatario}`,
+      `**Recurrente:** ${p.empresa_recurrente}, RNC ${p.rnc_recurrente}${p.rpe_recurrente ? `, RPE ${p.rpe_recurrente}` : ""}, representada por ${p.representante}.`,
+      `**Procedimiento:** ${p.codigo_proceso}${pr ? ` - ${fixEncoding(pr.titulo ?? "").trim()}` : ""}`,
+      `**Acto impugnado:** ${p.acto_impugnado}${p.fecha_notificacion ? `, notificado/publicado el ${p.fecha_notificacion}` : ""}.`,
+      tipo === "jerarquico_impropio" ? `**Antecedente:** resolucion que decidio el recurso de reconsideracion interpuesto ante ${institucion}.` : "",
+      "", "## I. Legitimacion y admisibilidad",
+      `La recurrente es oferente${p.rpe_recurrente ? " inscrita en el Registro de Proveedores del Estado" : ""} afectada en sus derechos e intereses legitimos por el acto impugnado (Art. 202 Ley 47-25). El recurso se presenta por escrito por la via habilitada (Art. 203) y dentro del plazo de diez (10) dias habiles (Art. ${tipo === "reconsideracion" ? "205" : "208"}).`,
+      "", "## II. Hechos", p.hechos,
+      "", "## III. Agravios y fundamentos de derecho",
+      p.agravios ?? "El acto impugnado vulnera los principios de juridicidad, objetividad, igualdad, libre competencia, transparencia y debido proceso que rigen las contrataciones publicas (Ley 47-25), asi como el deber de motivacion de los actos administrativos (Ley 107-13).",
+      "", "## IV. Pedimentos",
+      "PRIMERO: Declarar admisible el presente recurso por haber sido interpuesto en tiempo habil y conforme a la Ley 47-25.",
+      `SEGUNDO: En cuanto al fondo, revocar ${p.acto_impugnado} y ordenar la reevaluacion de las ofertas con apego a los criterios del pliego de condiciones.`,
+      "TERCERO: Ordenar la publicacion de la decision en el Sistema Electronico de Contrataciones Publicas.",
+      "", "Bajo reserva de derechos.", "", `${p.representante}`, `Por ${p.empresa_recurrente}`, `Fecha: ${hoy}`,
+    );
+    if (p.incluir_medida_cautelar) {
+      out.push("", "---", "# SOLICITUD DE MEDIDA CAUTELAR (instancia separada, Art. 211 Ley 47-25)",
+        "**A:** Direccion General de Contrataciones Publicas (DGCP)",
+        `**Recurrente:** ${p.empresa_recurrente}, RNC ${p.rnc_recurrente} | **Procedimiento:** ${p.codigo_proceso}`,
+        "",
+        `La interposicion del recurso no suspende los efectos del acto (Art. 201). Mientras se decide el recurso de ${tipo === "reconsideracion" ? "reconsideracion" : "jerarquico impropio"}, solicitamos ordenar la suspension provisional del procedimiento, incluida la firma o ejecucion del contrato, por concurrir:`,
+        "- Apariencia de buen derecho: los hechos y fundamentos expuestos en el recurso, que se anexa.",
+        "- Dano irreparable por la demora: de suscribirse o ejecutarse el contrato, la decision final del recurso quedaria sin efecto practico.",
+        "La DGCP notifica la solicitud en 2 dias habiles y las partes tienen 3 dias habiles para pronunciarse (Art. 212).",
+        "", `${p.representante} - ${p.empresa_recurrente}`);
+    }
+    out.push("", `_${AVISO_LEGAL} Hazlo revisar y firmar por un abogado antes de presentarlo._`);
+    return texto(out.filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n"));
+  }));
 }

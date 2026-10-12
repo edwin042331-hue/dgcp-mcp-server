@@ -1,440 +1,333 @@
 // src/tools/inteligenciaTools.ts
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { dgcpGet, dgcpListar } from "../services/dgcpClient.js";
+import { resolverProveedor, inhabilitacionesVigentes } from "../services/catalogos.js";
 import {
-  dgcpGetVariasPaginas, formatMonto, truncate, fixEncoding,
-  soloFecha, diasHasta, sigueAbierto, normalizar, limpiarRNC, DgcpApiError,
-} from "../services/dgcpClient.js";
+  formatMonto, formatPct, fixEncoding, normalizar, sumar, soloDigitos, recortar, celda,
+} from "../utils/texto.js";
+import { formatFechaHoraRD, formatEpochRD, fechaISORD, soloFecha, cuentaRegresiva, diasHabilesEntre, parseFechaDGCP, msHasta } from "../utils/fechas.js";
 import {
-  MAX_RESPONSE_CHARS, TAMANO_PAGINA_API,
-  UMBRALES_BIENES_SERVICIOS, UMBRALES_OBRAS,
-  GARANTIA_SERIEDAD_OFERTA_PCT, GARANTIA_FIEL_CUMPLIMIENTO_PCT,
-  GARANTIA_FIEL_CUMPLIMIENTO_MIPYME_PCT, ANTICIPO_MAXIMO_PCT,
-} from "../constants.js";
-import type { ProcesoReal, ContratoReal, OfertaReal, ProveedorReal } from "../types.js";
+  regimenAplicable, describirRegimen, modalidadPorMonto, plazoMinimoPorModalidad, modalidadInferiorALaLegal,
+  claveModalidad, exentaDeSeriedad, GARANTIAS, UMBRALES_2026, ACLARACIONES_PCT_PLAZO, AVISO_LEGAL, FUENTES,
+  type TipoObjeto,
+} from "../normativa.js";
+import { texto, seguro, pie, SOLO_LECTURA, CALCULO_LOCAL } from "./comun.js";
+import { formatProveedor } from "./consultasTools.js";
+import type {
+  ProcesoReal, ContratoReal, OfertaReal, ArticuloProceso, DocumentoProceso, RubroProveedor,
+} from "../types.js";
 
-// ============================================================================
-// 1. TOOL: dgcp_inteligencia_proceso (Análisis 360° de Licitación)
-// ============================================================================
+/** Resultado de auditar el plazo de convocatoria contra el Art. 101 Ley 47-25. */
+export function auditarPlazo(p: ProcesoReal): { habiles: number; minimo: number; base: string; incumple: boolean } | null {
+  if (regimenAplicable(p.fecha_publicacion) !== "ley_47_25") return null;
+  const regla = plazoMinimoPorModalidad(p.modalidad);
+  if (!regla) return null;
+  const habiles = diasHabilesEntre(p.fecha_publicacion, p.fecha_fin_recepcion_ofertas);
+  if (habiles === null) return null;
+  return { habiles, minimo: regla.dias, base: regla.base, incumple: habiles < regla.dias };
+}
+
+function tipoObjeto(p: ProcesoReal): TipoObjeto {
+  return normalizar(p.objeto_proceso) === "obras" ? "obras" : "bienes_servicios";
+}
+
+function seccionGarantias(p: ProcesoReal, monto: number): string[] {
+  const regimen = regimenAplicable(p.fecha_publicacion);
+  const out = [`## Garantias y condiciones financieras (${describirRegimen(regimen)})`];
+  if (regimen !== "ley_47_25") {
+    out.push("Proceso convocado bajo el regimen anterior: las garantias y plazos se rigen por la Ley 340-06, el Dec. 416-23 y su pliego. Verificalos en el pliego.");
+    return out;
+  }
+  const mipyme = p.dirigido_mipymes === "Si";
+  if (exentaDeSeriedad(p.modalidad)) {
+    out.push(`- Seriedad de oferta: NO se exige en ${fixEncoding(p.modalidad)} (Art. 201 parrafo, Dec. 52-26).`);
+  } else {
+    out.push(`- Seriedad de oferta: 1% de TU oferta, dentro del Sobre B (Art. 202 Dec. 52-26). Sobre el presupuesto estimado seria ${formatMonto(monto * GARANTIAS.SERIEDAD_OFERTA_PCT)}. Errores materiales son subsanables en 1 a 5 dias habiles (Art. 204).`);
+    out.push(`  Si tu empresa es MIPYME: no se te puede exigir garantia de seriedad (Art. 175.2 Ley 47-25).`);
+  }
+  out.push(
+    `- Fiel cumplimiento: 4% del monto adjudicado = ${formatMonto(monto * GARANTIAS.FIEL_CUMPLIMIENTO_PCT)}; MIPYME 1% = ${formatMonto(monto * GARANTIAS.FIEL_CUMPLIMIENTO_MIPYME_PCT)} (Art. 207 Dec. 52-26). Obligatoria si el contrato supera el equivalente a US$10,000; se entrega en 5 dias habiles tras la adjudicacion (Arts. 205-206).`,
+    `- Anticipo MIPYME: la institucion debe otorgar 30% al firmar, sin factura = ${formatMonto(monto * GARANTIAS.ANTICIPO_MIPYME_PCT)} (Art. 174 Ley 47-25), respaldado por garantia de buen uso por el 100% del anticipo (Art. 210 Dec. 52-26).`,
+    `- Pago: la institucion tiene maximo 30 dias para pagar desde que se cumple la condicion de pago y se presenta el requerimiento (Art. 148 parrafo III Ley 47-25).`,
+  );
+  if (mipyme) out.push(`- Este proceso esta dirigido a MIPYMES${p.dirigido_mipymes_mujeres === "Si" ? " lideradas por mujeres" : ""}.`);
+  return out;
+}
+
+function seccionLegalidad(p: ProcesoReal, monto: number): string[] {
+  const out: string[] = [];
+  const plazo = auditarPlazo(p);
+  if (plazo) {
+    out.push(plazo.incumple
+      ? `- ALERTA plazo: entre la publicacion y el cierre hay a lo sumo ${plazo.habiles} dias habiles; el minimo para ${fixEncoding(p.modalidad)} es ${plazo.minimo} (${plazo.base}). Conteo sin feriados: el incumplimiento es cierto.`
+      : `- Plazo de convocatoria: ${plazo.habiles} dias habiles (sin descontar feriados) frente a un minimo de ${plazo.minimo} (${plazo.base}). Conforme.`);
+  }
+  if (regimenAplicable(p.fecha_publicacion) === "ley_47_25" && monto > 0) {
+    const legal = modalidadPorMonto(monto, tipoObjeto(p));
+    const inferior = modalidadInferiorALaLegal(p.modalidad, legal);
+    if (inferior === true) {
+      out.push(`- ALERTA modalidad: por ${formatMonto(monto)} corresponde ${legal.nombre} (${FUENTES.umbrales}), pero se convoco como ${fixEncoding(p.modalidad)}. Revisar posible fraccionamiento (Art. 81 Ley 47-25) o justificacion de excepcion.`);
+    } else if (inferior === false) {
+      out.push(`- Modalidad: ${fixEncoding(p.modalidad)} es compatible con el monto (por umbral corresponde como minimo ${legal.nombre}; el Art. 59 P. II permite una modalidad superior).`);
+    }
+  }
+  const cierre = parseFechaDGCP(p.fecha_fin_recepcion_ofertas);
+  const pub = parseFechaDGCP(p.fecha_publicacion);
+  if (cierre !== null && pub !== null && cierre > Date.now()) {
+    const limiteAclaraciones = pub + (cierre - pub) * ACLARACIONES_PCT_PLAZO;
+    const iso = formatEpochRD(limiteAclaraciones);
+    out.push(limiteAclaraciones > Date.now()
+      ? `- Aclaraciones al pliego: puedes pedirlas hasta aprox. ${iso} (50% del plazo, Art. 102 Ley 47-25).`
+      : `- Aclaraciones al pliego: el plazo para pedirlas (50% del periodo de ofertas, Art. 102) ya paso.`);
+  }
+  return out.length ? ["## Control de legalidad", ...out] : [];
+}
+
 const InteligenciaSchema = z.object({
-  codigo_proceso: z.string().describe("Codigo oficial del proceso (ej. 'TSS-DAF-CM-2026-0055' o 'HLA-DAF-CD-2026-0121')."),
-  paginas_historial: z.number().int().min(1).max(25).optional()
-    .describe("Paginas a escanear en contratos y ofertas para buscar antecedentes (default 12 = 1,200 registros)"),
+  codigo_proceso: z.string().min(3).describe("Codigo oficial del proceso, ej. 'MIP-CCC-LPN-2026-0005'."),
 }).strict();
 
-type InteligenciaInput = z.infer<typeof InteligenciaSchema>;
+const RadiografiaSchema = z.object({
+  termino: z.string().min(2).describe("RPE, RNC/cedula o nombre de la empresa."),
+}).strict();
+
+const CalculadoraSchema = z.object({
+  monto_estimado: z.number().positive().describe("Presupuesto estimado en DOP."),
+  tipo_objeto: z.enum(["bienes_servicios", "obras"]).optional().describe("Default 'bienes_servicios'."),
+  modalidad_planteada: z.string().optional().describe("Modalidad usada por la institucion, para verificar si es inferior a la legal."),
+  es_mipyme: z.boolean().optional().describe("true si el oferente es MIPYME certificada."),
+}).strict();
 
 export function registerInteligenciaTools(server: McpServer): void {
-  // HERRAMIENTA 1: Inteligencia 360° de una Licitación
   server.registerTool("dgcp_inteligencia_proceso", {
-    title: "Inteligencia 360° de Proceso: Quién ganó antes y Estrategia",
-    description: `Realiza un análisis integral 360° de una licitación pública en la DGCP:
-1. Extrae la ficha técnica del proceso (monto, vigencia, modalidad, reservas MIPYME).
-2. Busca automáticamente antecedentes de contratación en esa misma institución y objeto contractual ("¿Quién ganó antes?").
-3. Detecta ofertas y precios de referencia de competidores.
-4. Calcula automáticamente las garantías legales obligatorias (Seriedad 1%, Fiel Cumplimiento 4% o 1% MIPYME, Anticipo 20%).
-5. Genera la hoja de ruta y estrategia legal ganadora bajo la Ley 340-06.`,
-    inputSchema: InteligenciaSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async (params: InteligenciaInput) => {
-    try {
-      const codBuscado = params.codigo_proceso.trim();
-      const codNorm = normalizar(codBuscado);
-      const paginasHistorial = params.paginas_historial ?? 12;
-
-      // 1. Buscar proceso objetivo
-      const procData = await dgcpGetVariasPaginas<ProcesoReal>("procesos", 8, TAMANO_PAGINA_API);
-      const proceso = procData.items.find((p) => normalizar(p.codigo_proceso) === codNorm);
-
-      let unidadCompra = "";
-      let tituloProceso = "";
-      let montoEstimado = 0;
-      let modalidad = "";
-      let diasRestantes: number | null = null;
-      let urlPortal = "";
-      let esMipyme = false;
-
-      const out: string[] = [];
-
-      if (proceso) {
-        unidadCompra = proceso.unidad_compra ?? "";
-        tituloProceso = proceso.titulo ?? "";
-        montoEstimado = typeof proceso.monto_estimado === "number" ? proceso.monto_estimado : 0;
-        modalidad = proceso.modalidad ?? "";
-        diasRestantes = diasHasta(proceso.fecha_fin_recepcion_ofertas);
-        urlPortal = proceso.url ?? "";
-        esMipyme = proceso.dirigido_mipymes === "Si";
-
-        out.push(
-          `# INFORME DE INTELIGENCIA ESTRATÉGICA DGCP (Ley 340-06)`,
-          `**Proceso:** ${codBuscado}`,
-          `**Objeto:** ${fixEncoding(tituloProceso)}`,
-          `**Institución:** ${fixEncoding(unidadCompra)}`,
-          `**Modalidad:** ${fixEncoding(modalidad)}`,
-          `**Presupuesto Estimado:** ${formatMonto(montoEstimado, proceso.divisa ?? "DOP")}`,
-          `**Cierre de Ofertas:** ${soloFecha(proceso.fecha_fin_recepcion_ofertas)} (${diasRestantes !== null && diasRestantes >= 0 ? `Quedan ${diasRestantes} días` : "PLAZO VENCIDO"})`,
-          `**Reserva MIPYME:** ${esMipyme ? "SÍ (Exclusivo MIPYMES conforme a Ley 488-08 y Dec. 416-23)" : "NO (Abierto nacional/general)"}`,
-          urlPortal ? `**Portal Transaccional:** ${urlPortal}` : "",
-          "---",
-        );
-      } else {
-        out.push(
-          `# INFORME DE INTELIGENCIA DGCP - Búsqueda Directa por Código: ${codBuscado}`,
-          `*Aviso: El proceso no apareció en los últimos ${procData.items.length} procesos activos de la DGCP. Se auditarán contratos y ofertas con ese código o institución.*`,
-          "---",
-        );
-      }
-
-      // 2. Buscar Contratos Anteriores de esa institución o para ese proceso
-      const contratosData = await dgcpGetVariasPaginas<ContratoReal>("contratos", paginasHistorial, TAMANO_PAGINA_API);
-      const contratosDirectos = contratosData.items.filter((c) => normalizar(c.codigo_proceso) === codNorm);
-      
-      const uNorm = normalizar(unidadCompra);
-      const contratosInstitucion = contratosData.items.filter((c) =>
-        uNorm.length > 3 && normalizar(c.unidad_compra).includes(uNorm)
-      );
-
-      out.push(`## 1. Antecedentes de Adjudicación e Historial ("¿Quién ganó antes?")`);
-
-      if (contratosDirectos.length > 0) {
-        out.push(`Se encontraron **${contratosDirectos.length} contrato(s) adjudicado(s)** directamente para este código de proceso:`);
-        contratosDirectos.forEach((c, idx) => {
-          out.push(
-            `   ${idx + 1}. **${fixEncoding(c.razon_social)}** (RPE: ${c.rpe ?? "N/D"})`,
-            `      - Contrato: ${c.codigo_contrato ?? "N/D"} | Monto Adjudicado: ${formatMonto(c.valor_contratado, c.divisa ?? "DOP")}`,
-            `      - Estado: ${c.estado_contrato} | Adjudicación: ${c.estado_adjudicacion}`,
-            `      - Condiciones: ${fixEncoding(c.metodo_pago ?? "N/D")} (Plazo: ${fixEncoding(c.plazo_pago_factura ?? "N/D")})`,
-            c.url_contrato ? `      - Enlace Contrato: ${c.url_contrato}` : "",
-          );
-        });
-      } else if (contratosInstitucion.length > 0) {
-        out.push(`No hay contrato adjudicado aún para este proceso puntual, pero se auditaron **${contratosInstitucion.length} contratos recientes adjudicados por ${fixEncoding(unidadCompra)}**:`);
-        contratosInstitucion.slice(0, 4).forEach((c, idx) => {
-          out.push(
-            `   ${idx + 1}. **${fixEncoding(c.descripcion?.trim() || c.codigo_contrato)}**`,
-            `      - Ganador: **${fixEncoding(c.razon_social)}** (RPE: ${c.rpe ?? "N/D"})`,
-            `      - Monto: ${formatMonto(c.valor_contratado, c.divisa ?? "DOP")} | Fecha: ${soloFecha(c.fecha_adjudicacion)}`,
-            `      - Plazo de Pago: ${fixEncoding(c.plazo_pago_factura ?? "N/D")} vía ${fixEncoding(c.metodo_pago ?? "N/D")}`,
-          );
-        });
-      } else {
-        out.push(`No se encontraron contratos registrados para esta institución dentro de los ${contratosData.items.length} contratos más recientes de la DGCP.`);
-      }
-
-      // 3. Buscar Ofertas de Competidores
-      const ofertasData = await dgcpGetVariasPaginas<OfertaReal>("ofertas", paginasHistorial, TAMANO_PAGINA_API);
-      const ofertasDirectas = ofertasData.items.filter((o) => normalizar(o.codigo_proceso) === codNorm);
-      const ofertasInstitucion = ofertasData.items.filter((o) =>
-        uNorm.length > 3 && normalizar(o.unidad_compra).includes(uNorm)
-      );
-
-      out.push("", `## 2. Auditoría de Competidores y Ofertas Presentadas`);
-
-      if (ofertasDirectas.length > 0) {
-        out.push(`Ofertas recibidas específicamente en este proceso (${ofertasDirectas.length} ofertas):`);
-        ofertasDirectas.forEach((o, idx) => {
-          out.push(
-            `   ${idx + 1}. **${fixEncoding(o.razon_social)}** (RPE: ${o.rpe ?? "N/D"})`,
-            `      - Valor Ofertado: ${formatMonto(o.valor_oferta, "DOP")}`,
-            `      - Tipo de Oferta: ${fixEncoding(o.tipo_oferta)} | Estado Evaluación: ${fixEncoding(o.estado_evaluacion)}`,
-          );
-        });
-      } else if (ofertasInstitucion.length > 0) {
-        out.push(`Oferentes habituales que cotizan a ${fixEncoding(unidadCompra)} en procesos recientes:`);
-        const vistos = new Set<string>();
-        let count = 0;
-        for (const o of ofertasInstitucion) {
-          const prov = fixEncoding(o.razon_social);
-          if (!vistos.has(prov) && count < 4) {
-            vistos.add(prov);
-            count++;
-            out.push(`   - **${prov}** (RPE: ${o.rpe ?? "N/D"}) | Última oferta registrada: ${formatMonto(o.valor_oferta, "DOP")} (${soloFecha(o.fecha_creacion)})`);
-          }
-        }
-      } else {
-        out.push(`No se detectaron ofertas en la muestra para esta institución.`);
-      }
-
-      // 4. Cálculo Normativo de Garantías (Ley 340-06)
-      if (montoEstimado > 0) {
-        const garantiaSeriedad = montoEstimado * GARANTIA_SERIEDAD_OFERTA_PCT;
-        const garantiaFielCumplimientoGen = montoEstimado * GARANTIA_FIEL_CUMPLIMIENTO_PCT;
-        const garantiaFielCumplimientoMipyme = montoEstimado * GARANTIA_FIEL_CUMPLIMIENTO_MIPYME_PCT;
-        const anticipoMax = montoEstimado * ANTICIPO_MAXIMO_PCT;
-
-        out.push(
-          "",
-          `## 3. Matriz Financiera y Garantías Obligatorias (Ley 340-06 y Dec. 416-23)`,
-          `- **Póliza de Garantía de Seriedad de la Oferta (1%):** **${formatMonto(garantiaSeriedad)}**`,
-          `  *(Obligatoria para Licitación Pública y Comparación de Precios. Emitida por aseguradora regulada por la Superintendencia de Seguros).*`,
-          `- **Garantía de Fiel Cumplimiento de Contrato (4% General):** **${formatMonto(garantiaFielCumplimientoGen)}**`,
-          `- **Garantía de Fiel Cumplimiento Especial MIPYME (1% Dec. 416-23):** **${formatMonto(garantiaFielCumplimientoMipyme)}** *(Ahorro del 75% en costo de póliza si estás certificado MICM)*`,
-          `- **Anticipo Máximo Legal (20%):** Hasta **${formatMonto(anticipoMax)}**`,
-        );
-      }
-
-      // 5. Estrategia Ganadora
-      out.push(
-        "",
-        `## 4. Estrategia Senior y Hoja de Ruta para Ganar la Licitación`,
-        `1. **Sobre A (Blindaje Habilitante Inflexible):**`,
-        `   - **RPE:** Certificado activo y con rubro específico para este objeto.`,
-        `   - **DGII:** Certificación emitida en el mes en curso (cero deudas fiscales).`,
-        `   - **TSS:** Certificación vigente sin atrasos de pago de nómina.`,
-        `   - **Garantía de Seriedad:** Presentar el original de la póliza por el 1% exacto con vigencia mínima requerida en pliego (usualmente 60 a 90 días).`,
-        `   - **Declaración Jurada Notarial:** Art. 14 de Ley 340-06 firmada y legalizada.`,
-        `2. **Propuesta Técnica:**`,
-        `   - Cumplir literal y estrictamente las Fichas Técnicas sin condicionamientos. Si es tecnología, adjuntar Carta de Autorización del Fabricante (MAF).`,
-        `3. **Sobre B (Estrategia Económica):**`,
-        `   - Ajustar el precio unitario considerando plazos de pago y retenciones estatales (5% IESP / ITBIS).`,
-        `   - Rango competitivo recomendado: entre el 92% y 96% del presupuesto oficial estimado para liderar en puntuación económica.`,
-      );
-
-      return { content: [{ type: "text", text: truncate(out.join("\n"), MAX_RESPONSE_CHARS) }] };
-    } catch (err) {
-      if (err instanceof DgcpApiError) {
-        return { content: [{ type: "text", text: `Error en análisis de inteligencia: ${err.message}` }] };
-      }
-      throw err;
+    title: "Expediente 360 de un proceso de compra (DGCP)",
+    description: `Arma el expediente completo de una licitacion en una sola llamada, con consultas exactas a la API:
+1. Ficha y cronograma (hora RD) con cuenta regresiva y regimen legal aplicable (Ley 47-25 o 340-06 transitoria).
+2. Articulos solicitados (codigo UNSPSC, cantidades y precio unitario estimado por la institucion).
+3. Documentos del pliego publicados (enlaces directos).
+4. Ofertas recibidas y contratos adjudicados del proceso.
+5. Historial de la institucion: a quien le compra y cuanto (ultimos contratos).
+6. Control de legalidad: plazo minimo del Art. 101, modalidad vs umbral (posible fraccionamiento), fecha limite de aclaraciones.
+7. Garantias, anticipo MIPYME y plazo de pago segun la Ley 47-25 y el Dec. 52-26.`,
+    inputSchema: InteligenciaSchema.shape,
+    annotations: SOLO_LECTURA,
+  }, seguro("Error armando el expediente del proceso", async ({ codigo_proceso }: z.infer<typeof InteligenciaSchema>) => {
+    const cod = codigo_proceso.trim();
+    const [proc, articulos, documentos, ofertas, contratos] = await Promise.all([
+      dgcpListar<ProcesoReal>("procesos", { proceso: cod }, { maxPaginas: 1, limite: 10 }),
+      dgcpListar<ArticuloProceso>("procesos/articulos", { proceso: cod }, { maxPaginas: 2 }),
+      dgcpGet<{ payload?: { content?: DocumentoProceso[] | null } }>("procesos/documentos", { proceso: cod }).catch(() => null),
+      dgcpListar<OfertaReal>("ofertas", { proceso: cod }, { maxPaginas: 2 }),
+      dgcpListar<ContratoReal>("contratos", { proceso: cod }, { maxPaginas: 2 }),
+    ]);
+    const p = proc.items.find((x) => normalizar(x.codigo_proceso) === normalizar(cod)) ?? proc.items[0];
+    if (!p) {
+      return texto(`No existe el proceso "${cod}" en la API DGCP. Verifica el codigo exacto (ej. 'MIP-CCC-LPN-2026-0005'); si se publico hace pocas horas, aparecera tras el proximo corte de datos.` + pie());
     }
-  });
+    const monto = typeof p.monto_estimado === "number" ? p.monto_estimado : 0;
+    const out: string[] = [
+      `# Expediente: ${fixEncoding(p.titulo ?? cod).trim()}`,
+      `**Codigo:** ${p.codigo_proceso} | **Institucion:** ${fixEncoding(p.unidad_compra ?? "N/D")} (cod. ${p.codigo_unidad_compra ?? "N/D"})`,
+      `**Modalidad:** ${fixEncoding(p.modalidad ?? "N/D")}${p.tipo_excepcion && p.tipo_excepcion !== "Proceso ordinario" ? ` (${fixEncoding(p.tipo_excepcion)})` : ""} | **Objeto:** ${fixEncoding(p.objeto_proceso ?? "N/D")}${p.subobjeto_proceso ? ` / ${fixEncoding(p.subobjeto_proceso)}` : ""}`,
+      `**Presupuesto estimado:** ${formatMonto(monto, p.divisa ?? "DOP")} | **Estado:** ${fixEncoding(p.estado_proceso ?? "N/D")}`,
+      `**MIPYME:** ${p.dirigido_mipymes === "Si" ? `Si${p.dirigido_mipymes_mujeres === "Si" ? " (mujeres)" : ""}` : "No"} | **Lotes:** ${p.proceso_lotificado ?? "N/D"} | **Proveedores notificados:** ${p.numero_proveedores_notificados ?? "N/D"}`,
+      `**Regimen legal:** ${describirRegimen(regimenAplicable(p.fecha_publicacion))}`,
+      p.url ? `**Portal:** ${String(p.url).replace("//Public", "/Public")}` : "",
+      "",
+      "## Cronograma (hora RD)",
+      `- Publicacion: ${formatFechaHoraRD(p.fecha_publicacion)}${p.fecha_enmienda ? ` | Fecha limite de enmiendas: ${formatFechaHoraRD(p.fecha_enmienda)}` : ""}`,
+      `- Cierre de ofertas: ${formatFechaHoraRD(p.fecha_fin_recepcion_ofertas)} (${cuentaRegresiva(p.fecha_fin_recepcion_ofertas)})`,
+      `- Apertura: ${formatFechaHoraRD(p.fecha_apertura_ofertas)} | Adjudicacion estimada: ${formatFechaHoraRD(p.fecha_estimada_adjudicacion)} | Suscripcion: ${formatFechaHoraRD(p.fecha_suscripcion)}`,
+      p.duracion_contrato ? `- Duracion del contrato: ${p.duracion_contrato}` : "",
+      "",
+    ].filter((l, i, a) => l !== "" || a[i - 1] !== "");
 
-  // HERRAMIENTA 2: Radiografía Completa de un Proveedor / Competidor
-  const RadiografiaSchema = z.object({
-    termino: z.string().describe("Nombre de la empresa, RNC (con o sin guiones) o número de RPE a auditar."),
-    paginas: z.number().int().min(1).max(25).optional()
-      .describe("Páginas de contratos a escanear para auditoría de facturación estatal (default 15 = 1,500 contratos)"),
-  }).strict();
+    // Articulos
+    if (articulos.items.length > 0) {
+      out.push(`## Articulos solicitados (${articulos.items.length})`,
+        "| # | Descripcion | UNSPSC | Cant. | Unidad | P. unitario est. | Total est. |",
+        "|---|---|---|---|---|---|---|");
+      articulos.items.slice(0, 25).forEach((a, i) => out.push(
+        `| ${i + 1} | ${celda(a.descripcion_usuario || a.descripcion_articulo, 70)} | ${a.subclase_unspsc ?? "N/D"} | ${a.cantidad ?? "N/D"} | ${celda(a.unidad_medida, 15)} | ${formatMonto(a.precio_unitario_estimado)} | ${formatMonto(a.precio_total_estimado)} |`));
+      if (articulos.items.length > 25) out.push(`_(+${articulos.items.length - 25} articulos mas)_`);
+      out.push("Tip: usa dgcp_precios_referencia con la subclase UNSPSC para ver a que precio se ha adjudicado ese articulo antes.", "");
+    }
 
-  type RadiografiaInput = z.infer<typeof RadiografiaSchema>;
+    // Documentos
+    const docs = documentos?.payload?.content ?? [];
+    if (docs.length > 0) {
+      out.push(`## Documentos publicados (${docs.length})`);
+      [...docs].sort((a, b) => (parseFechaDGCP(b.fecha_carga_archivo) ?? 0) - (parseFechaDGCP(a.fecha_carga_archivo) ?? 0))
+        .slice(0, 20)
+        .forEach((d) => out.push(`- ${recortar(d.nombre_documento, 90)} (${recortar(d.tipo_documento, 60)}, ${formatFechaHoraRD(d.fecha_carga_archivo)}): ${d.url_documento ?? "sin enlace"}`));
+      out.push("");
+    }
+
+    // Ofertas y contratos del proceso
+    out.push(`## Ofertas recibidas (${ofertas.items.length})`);
+    if (ofertas.items.length === 0) {
+      out.push((msHasta(p.fecha_fin_recepcion_ofertas) ?? 0) > 0
+        ? "Aun no hay ofertas visibles: el plazo sigue abierto y las ofertas se publican tras la apertura."
+        : "La API no registra ofertas para este proceso.");
+    } else {
+      const ord = [...ofertas.items].sort((a, b) => (a.valor_oferta ?? Infinity) - (b.valor_oferta ?? Infinity));
+      const minimo = ord[0].valor_oferta ?? 0;
+      ord.slice(0, 20).forEach((o, i) => out.push(
+        `${i + 1}. ${fixEncoding(o.razon_social ?? "N/D")} (RPE ${o.rpe ?? "N/D"}): ${formatMonto(o.valor_oferta)}${monto > 0 && o.valor_oferta ? ` = ${formatPct((o.valor_oferta / monto) * 100)} del estimado` : ""}${i > 0 && minimo > 0 && o.valor_oferta ? `, +${formatPct(((o.valor_oferta - minimo) / minimo) * 100)} sobre la menor` : ""}`));
+    }
+    out.push("", `## Adjudicacion (${contratos.items.length} contrato(s))`);
+    if (contratos.items.length === 0) out.push("Sin contratos registrados para este proceso todavia.");
+    contratos.items.forEach((c) => out.push(
+      `- ${fixEncoding(c.razon_social ?? "N/D")} (RPE ${c.rpe ?? "N/D"}): ${formatMonto(c.valor_contratado, c.divisa ?? "DOP")} | ${fixEncoding(c.estado_contrato ?? "")} | pago ${fixEncoding(c.metodo_pago ?? "N/D")}, ${fixEncoding(c.plazo_pago_factura ?? "N/D")}${c.url_contrato ? ` | ${c.url_contrato}` : ""}`));
+
+    // Historial de la institucion
+    if (p.codigo_unidad_compra) {
+      const hist = await dgcpListar<ContratoReal>("contratos", { unidad_compra: p.codigo_unidad_compra }, { maxPaginas: 1 });
+      if (hist.items.length > 0) {
+        const porProv = new Map<string, { nombre: string; monto: number; n: number }>();
+        for (const c of hist.items) {
+          const k = soloDigitos(c.rpe) || normalizar(c.razon_social);
+          const e = porProv.get(k) ?? { nombre: fixEncoding(c.razon_social ?? "N/D"), monto: 0, n: 0 };
+          e.monto += c.valor_contratado ?? 0;
+          e.n++;
+          porProv.set(k, e);
+        }
+        const total = sumar(hist.items, (c) => c.valor_contratado);
+        const top = [...porProv.entries()].sort((a, b) => b[1].monto - a[1].monto).slice(0, 8);
+        out.push("", `## A quien le compra ${fixEncoding(p.unidad_compra ?? "la institucion")} (ultimos ${hist.items.length} contratos de ${hist.total.toLocaleString("en-US")})`,
+          `Total: ${formatMonto(total)} entre ${porProv.size} proveedores.`);
+        top.forEach(([rpe, e], i) => out.push(`${i + 1}. ${e.nombre} (RPE ${rpe}): ${e.n} contratos, ${formatMonto(e.monto)} (${formatPct(total > 0 ? (e.monto / total) * 100 : 0)})`));
+        const similares = hist.items.filter((c) => {
+          const palabras = normalizar(p.titulo).split(" ").filter((w) => w.length > 5).slice(0, 6);
+          const d = normalizar(c.descripcion);
+          return palabras.filter((w) => d.includes(w)).length >= 2 && normalizar(c.codigo_proceso) !== normalizar(cod);
+        }).slice(0, 5);
+        if (similares.length > 0) {
+          out.push("", "### Contratos anteriores parecidos (quien gano antes)");
+          similares.forEach((c) => out.push(`- ${soloFecha(c.fecha_adjudicacion)} | ${recortar(c.descripcion, 80)} -> ${fixEncoding(c.razon_social ?? "N/D")}: ${formatMonto(c.valor_contratado)}`));
+        }
+      }
+    }
+
+    out.push("", ...seccionLegalidad(p, monto), "", ...seccionGarantias(p, monto), "", `_${AVISO_LEGAL}_`);
+    return texto(out.join("\n") + pie());
+  }));
 
   server.registerTool("dgcp_radiografia_proveedor", {
-    title: "Radiografía de Proveedor: RPE, Contratos Ganados y Cuota de Mercado",
-    description: `Audita integralmente a un proveedor o competidor en las contrataciones públicas:
-1. Verifica su ficha en el RPE: RNC, estatus (Activo/Inactivo), clasificación MIPYME, fecha de registro y contactos.
-2. Calcula su volumen total de contratos ganados en el Estado en la muestra reciente.
-3. Identifica sus clientes principales en el sector público (a qué instituciones les vende más).
-4. Analiza sus márgenes y presencia en licitaciones del gobierno dominicano.`,
-    inputSchema: RadiografiaSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async (params: RadiografiaInput) => {
-    try {
-      const termRaw = params.termino.trim();
-      const termNorm = normalizar(termRaw);
-      const termRnc = limpiarRNC(termRaw);
-      const paginas = params.paginas ?? 15;
-
-      // 1. Buscar en proveedores (RPE)
-      const provData = await dgcpGetVariasPaginas<ProveedorReal>("proveedores", 10, TAMANO_PAGINA_API);
-      const proveedor = provData.items.find((p) => {
-        const rncP = limpiarRNC(p.numero_documento);
-        const rpeP = String(p.rpe ?? "");
-        const nombreP = normalizar(p.razon_social);
-        return (termRnc.length > 0 && rncP === termRnc) ||
-               rpeP === termRaw ||
-               nombreP.includes(termNorm);
-      });
-
-      // 2. Buscar contratos ganados por este proveedor
-      const contrData = await dgcpGetVariasPaginas<ContratoReal>("contratos", paginas, TAMANO_PAGINA_API);
-      const provRpe = proveedor?.rpe ? String(proveedor.rpe) : termRaw;
-      const provNombre = proveedor?.razon_social ? normalizar(proveedor.razon_social) : termNorm;
-
-      const contratosGanados = contrData.items.filter((c) => {
-        const cRpe = String(c.rpe ?? "").trim();
-        const cNombre = normalizar(c.razon_social);
-        return (cRpe.length > 0 && cRpe === provRpe) || cNombre.includes(provNombre);
-      });
-
-      const out: string[] = [
-        `# RADIOGRAFÍA Y AUDITORÍA DE PROVEEDOR DGCP`,
-        `**Término Consultado:** ${termRaw}`,
-        "---",
-      ];
-
-      if (proveedor) {
-        out.push(
-          `## 1. Ficha del Registro de Proveedores del Estado (RPE)`,
-          `- **Razón Social:** ${fixEncoding(proveedor.razon_social)}`,
-          `- **RPE:** ${proveedor.rpe ?? "N/D"} | **${proveedor.tipo_documento ?? "RNC"}:** ${proveedor.numero_documento ?? "N/D"}`,
-          `- **Estatus Jurídico:** ${fixEncoding(proveedor.estado)} | Tipo: ${fixEncoding(proveedor.tipo_persona)} (${fixEncoding(proveedor.forma_juridica)})`,
-          `- **Clasificación MIPYME:** ${proveedor.es_mipyme === "Si" ? "SÍ (Acreditado)" : "NO"}${proveedor.certificacion_micm === "Si" ? " | Certificación MICM Activa" : ""}`,
-          `- **Rubro Registrado:** ${fixEncoding(proveedor.provee)}`,
-          `- **Ubicación:** ${fixEncoding(proveedor.provincia ?? "N/D")}, ${fixEncoding(proveedor.municipio ?? "")}`,
-          proveedor.direccion ? `- **Dirección:** ${fixEncoding(proveedor.direccion)}` : "",
-          proveedor.contacto ? `- **Contacto Principal:** ${fixEncoding(proveedor.contacto).trim()} (${fixEncoding(proveedor.posicion_contacto ?? "Representante")}) | Tel: ${proveedor.telefono_comercial ?? "N/D"} | Email: ${proveedor.correo_comercial ?? "N/D"}` : "",
-          proveedor.url_certificacion ? `- **Certificación Oficial RPE:** ${proveedor.url_certificacion}` : "",
-          "",
-        );
-      } else {
-        out.push(`*Aviso: No se localizó en la muestra reciente de RPE. Se auditarán sus contratos en el Estado.*`, "");
-      }
-
-      out.push(`## 2. Desempeño y Contratos Adjudicados en el Estado`);
-
-      if (contratosGanados.length > 0) {
-        const totalFacturado = contratosGanados.reduce((acc, c) => acc + (typeof c.valor_contratado === "number" ? c.valor_contratado : 0), 0);
-        
-        // Agrupar por institución
-        const porInstitucion = new Map<string, number>();
-        contratosGanados.forEach((c) => {
-          const inst = fixEncoding(c.unidad_compra) || "Otras";
-          porInstitucion.set(inst, (porInstitucion.get(inst) ?? 0) + (typeof c.valor_contratado === "number" ? c.valor_contratado : 0));
-        });
-
-        out.push(
-          `- **Total de Contratos Ganados (Muestra):** ${contratosGanados.length} contratos`,
-          `- **Monto Total Facturado al Estado:** **${formatMonto(totalFacturado)}**`,
-          `- **Promedio por Contrato:** **${formatMonto(totalFacturado / contratosGanados.length)}**`,
-          "",
-          `### Principales Clientes en el Estado (Mayor concentración):`,
-        );
-
-        Array.from(porInstitucion.entries())
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 5)
-          .forEach(([inst, totalInst], idx) => {
-            out.push(`   ${idx + 1}. **${inst}**: ${formatMonto(totalInst)}`);
-          });
-
-        out.push("", `### Últimos Contratos Firmados:`);
-        contratosGanados.slice(0, 5).forEach((c, idx) => {
-          out.push(
-            `   ${idx + 1}. **${c.codigo_contrato}** (${soloFecha(c.fecha_adjudicacion)})`,
-            `      - Objeto: ${fixEncoding(c.descripcion?.trim() || "S/D")}`,
-            `      - Entidad: ${fixEncoding(c.unidad_compra)} | Monto: ${formatMonto(c.valor_contratado, c.divisa ?? "DOP")}`,
-            `      - Pago: ${fixEncoding(c.metodo_pago ?? "N/D")} (Plazo: ${fixEncoding(c.plazo_pago_factura ?? "N/D")})`,
-          );
-        });
-      } else {
-        out.push(`No se encontraron contratos adjudicados para este proveedor dentro de la muestra de ${contrData.items.length} contratos recientes.`);
-      }
-
-      return { content: [{ type: "text", text: truncate(out.join("\n"), MAX_RESPONSE_CHARS) }] };
-    } catch (err) {
-      if (err instanceof DgcpApiError) {
-        return { content: [{ type: "text", text: `Error en radiografía de proveedor: ${err.message}` }] };
-      }
-      throw err;
+    title: "Radiografia de un proveedor del Estado (DGCP)",
+    description: `Perfil completo y exacto de una empresa en compras publicas a partir de su RPE, RNC o nombre:
+ficha RPE, alerta de inhabilitacion/suspension, rubros UNSPSC registrados, TODOS sus contratos (monto total, clientes principales, ultimos contratos) y sus ofertas (tasa de exito: procesos ganados / procesos ofertados).`,
+    inputSchema: RadiografiaSchema.shape,
+    annotations: SOLO_LECTURA,
+  }, seguro("Error en la radiografia del proveedor", async ({ termino }: z.infer<typeof RadiografiaSchema>) => {
+    const r = await resolverProveedor(termino);
+    if (!r.proveedor) {
+      return texto(`No se pudo identificar a "${termino}". Usa el RPE o el RNC; por nombre solo se reconocen empresas con actividad reciente.` + pie());
     }
-  });
+    const prov = r.proveedor;
+    const rpe = Number(soloDigitos(prov.rpe));
+    const [contratos, ofertas, rubros, inh] = await Promise.all([
+      dgcpListar<ContratoReal>("contratos", { rpe }, { maxPaginas: 5 }),
+      dgcpListar<OfertaReal>("ofertas", { rpe }, { maxPaginas: 5 }),
+      dgcpListar<RubroProveedor>("proveedores/rubro", { rpe }, { maxPaginas: 1 }).catch(() => null),
+      inhabilitacionesVigentes(rpe),
+    ]);
 
-  // HERRAMIENTA 3: Calculadora Legal y de Umbrales Oficiales DGCP
-  const CalculadoraSchema = z.object({
-    monto_estimado: z.number().positive().describe("Monto estimado del proceso en pesos dominicanos (DOP)."),
-    tipo_objeto: z.enum(["bienes_servicios", "obras"]).default("bienes_servicios")
-      .describe("Tipo de contratación: 'bienes_servicios' u 'obras'"),
-    modalidad_planteada: z.string().optional()
-      .describe("Modalidad utilizada por la institución para validar si es correcta o si incurre en fraccionamiento."),
-    es_mipyme: z.boolean().optional().default(false)
-      .describe("true si la empresa oferente cuenta con certificación MIPYME del MICM"),
-  }).strict();
+    const out = [`# Radiografia del proveedor`, formatProveedor(prov)];
+    if (r.alternativas.length > 0) out.push(`_Otras empresas con nombre parecido: ${r.alternativas.map((a) => `${a.razon_social} (RPE ${a.rpe})`).join("; ")}_`);
+    for (const i of inh) {
+      out.push(i.es_sancion
+        ? `**ALERTA: figura como inhabilitado/suspendido desde ${i.fecha_inhabilitacion.slice(0, 10)}.** Motivo oficial: ${i.motivo}`
+        : `Registro cancelado/suspendido a solicitud propia desde ${i.fecha_inhabilitacion.slice(0, 10)}.`);
+    }
+    if (rubros && rubros.items.length > 0) {
+      out.push("", `## Rubros registrados (${rubros.items.length} familias UNSPSC)`,
+        rubros.items.slice(0, 15).map((x) => `${x.familia_unspsc} ${recortar(x.descripcion, 50)}`).join("; ") + (rubros.items.length > 15 ? ` (+${rubros.items.length - 15})` : ""));
+    }
 
-  type CalculadoraInput = z.infer<typeof CalculadoraSchema>;
+    out.push("", "## Contratos con el Estado");
+    if (contratos.items.length === 0) {
+      out.push("No registra contratos adjudicados.");
+    } else {
+      const validos = contratos.items.filter((c) => !/cancel/i.test(String(c.estado_contrato)));
+      const total = sumar(validos, (c) => c.valor_contratado);
+      const porInst = new Map<string, { monto: number; n: number }>();
+      for (const c of validos) {
+        const k = fixEncoding(c.unidad_compra ?? "N/D");
+        const e = porInst.get(k) ?? { monto: 0, n: 0 };
+        e.monto += c.valor_contratado ?? 0; e.n++;
+        porInst.set(k, e);
+      }
+      const fechas = validos.map((c) => parseFechaDGCP(c.fecha_adjudicacion)).filter((x): x is number => x !== null).sort((a, b) => a - b);
+      out.push(
+        `${contratos.completo ? "Todos sus" : `Sus ${contratos.items.length.toLocaleString("en-US")} mas recientes de`} ${contratos.total.toLocaleString("en-US")} contratos. Validos (no cancelados): ${validos.length} por ${formatMonto(total)}; promedio ${formatMonto(validos.length ? total / validos.length : 0)}.`,
+        fechas.length ? `Periodo: ${fechaISORD(fechas[0])} a ${fechaISORD(fechas[fechas.length - 1])}.` : "",
+        "", "### Principales clientes",
+      );
+      [...porInst.entries()].sort((a, b) => b[1].monto - a[1].monto).slice(0, 8)
+        .forEach(([inst, e], i) => out.push(`${i + 1}. ${inst}: ${e.n} contratos, ${formatMonto(e.monto)} (${formatPct(total > 0 ? (e.monto / total) * 100 : 0)})`));
+      out.push("", "### Ultimos contratos");
+      [...validos].sort((a, b) => (parseFechaDGCP(b.fecha_adjudicacion) ?? 0) - (parseFechaDGCP(a.fecha_adjudicacion) ?? 0)).slice(0, 8)
+        .forEach((c) => out.push(`- ${soloFecha(c.fecha_adjudicacion)} | ${c.codigo_proceso} | ${recortar(c.descripcion, 70)} | ${fixEncoding(c.unidad_compra ?? "")}: ${formatMonto(c.valor_contratado)} (pago ${fixEncoding(c.plazo_pago_factura ?? "N/D")})`));
+    }
+
+    if (ofertas.items.length > 0) {
+      const procOfertados = new Set(ofertas.items.map((o) => normalizar(o.codigo_proceso)));
+      const procGanados = new Set(contratos.items.map((c) => normalizar(c.codigo_proceso)).filter((c) => procOfertados.has(c)));
+      out.push("", "## Ofertas y tasa de exito",
+        `Ofertas presentadas: ${ofertas.total.toLocaleString("en-US")} en ${procOfertados.size} procesos${ofertas.completo ? "" : " (muestra mas reciente)"}. Procesos ganados entre esos: ${procGanados.size} -> tasa de exito ${formatPct(procOfertados.size ? (procGanados.size / procOfertados.size) * 100 : 0)}.`,
+        `Valor ofertado total: ${formatMonto(sumar(ofertas.items, (o) => o.valor_oferta))}.`);
+    }
+    return texto(out.filter((l) => l !== undefined).join("\n") + pie());
+  }));
 
   server.registerTool("dgcp_calculadora_legal", {
-    title: "Calculadora Normativa DGCP: Umbrales, Garantías y Alertas de Ilegalidad",
-    description: `Calcula las obligaciones legales exactas bajo la Ley 340-06 para cualquier presupuesto:
-1. Determina la modalidad de contratación legal obligatoria (LPN, Comparación de Precios, Compra Menor, etc.).
-2. Detecta FRACCIONAMIENTO o uso de modalidad incorrecta por parte de la institución contratante (causal de impugnación).
-3. Calcula con precisión de centavos:
-   - Garantía de Seriedad de Oferta (1%).
-   - Garantía de Fiel Cumplimiento (4% General o 1% MIPYME con Decreto 416-23).
-   - Anticipo Máximo Legal (20%).
-4. Indica plazos mínimos legales de convocatoria y recepción de ofertas.`,
-    inputSchema: CalculadoraSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  }, async (params: CalculadoraInput) => {
-    const m = params.monto_estimado;
-    const esObras = params.tipo_objeto === "obras";
-    const esMipyme = params.es_mipyme;
-
-    let modalidadLegal = "";
-    let plazoMinimoDias = 0;
-    let requiereGarantiaSeriedad = false;
-
-    if (!esObras) {
-      if (m >= UMBRALES_BIENES_SERVICIOS.LICITACION_PUBLICA_MIN) {
-        modalidadLegal = "Licitación Pública Nacional (LPN)";
-        plazoMinimoDias = 30; // 30 días hábiles
-        requiereGarantiaSeriedad = true;
-      } else if (m >= UMBRALES_BIENES_SERVICIOS.COMPARACION_PRECIOS_MIN) {
-        modalidadLegal = "Comparación de Precios (CP)";
-        plazoMinimoDias = 5; // 5 días hábiles
-        requiereGarantiaSeriedad = true;
-      } else if (m >= UMBRALES_BIENES_SERVICIOS.COMPRAS_MENORES_MIN) {
-        modalidadLegal = "Compras Menores (CM)";
-        plazoMinimoDias = 2; // 2 días hábiles
-        requiereGarantiaSeriedad = false;
-      } else {
-        modalidadLegal = "Compras por Debajo del Umbral (CD)";
-        plazoMinimoDias = 1;
-        requiereGarantiaSeriedad = false;
-      }
-    } else {
-      if (m >= UMBRALES_OBRAS.LICITACION_PUBLICA_MIN) {
-        modalidadLegal = "Licitación Pública de Obras (LPN)";
-        plazoMinimoDias = 30;
-        requiereGarantiaSeriedad = true;
-      } else if (m >= UMBRALES_OBRAS.COMPARACION_PRECIOS_MIN) {
-        modalidadLegal = "Comparación de Precios de Obras (CP)";
-        plazoMinimoDias = 10;
-        requiereGarantiaSeriedad = true;
-      } else {
-        modalidadLegal = "Sorteo de Obras o Compra Menor";
-        plazoMinimoDias = 5;
-        requiereGarantiaSeriedad = false;
-      }
-    }
-
-    const gSeriedad = m * GARANTIA_SERIEDAD_OFERTA_PCT;
-    const gFielGen = m * GARANTIA_FIEL_CUMPLIMIENTO_PCT;
-    const gFielMipyme = m * GARANTIA_FIEL_CUMPLIMIENTO_MIPYME_PCT;
-    const anticipo = m * ANTICIPO_MAXIMO_PCT;
-
+    title: "Calculadora normativa: umbrales 2026, modalidad, plazos y garantias",
+    description: `Para un presupuesto dado calcula, con la Ley 47-25, el Dec. 52-26 y los umbrales 2026 (Resolucion PNP-03-2026):
+1. Modalidad que corresponde y plazo minimo de convocatoria (Art. 101).
+2. Si la modalidad usada por la institucion es inferior a la legal (indicio de fraccionamiento, Art. 81).
+3. Garantia de seriedad (1%), fiel cumplimiento (4% o 1% MIPYME), anticipo MIPYME (30%) y reglas especiales MIPYME.`,
+    inputSchema: CalculadoraSchema.shape,
+    annotations: CALCULO_LOCAL,
+  }, seguro("Error en la calculadora legal", async (p: z.infer<typeof CalculadoraSchema>) => {
+    const m = p.monto_estimado;
+    const tipo: TipoObjeto = p.tipo_objeto ?? "bienes_servicios";
+    const legal = modalidadPorMonto(m, tipo);
+    const u = UMBRALES_2026[tipo];
     const out = [
-      `# ANÁLISIS NORMATIVO Y CÁLCULO DE GARANTÍAS (Ley 340-06)`,
-      `**Monto Evaluado:** ${formatMonto(m)} | **Objeto:** ${esObras ? "Obras Públicas" : "Bienes y Servicios"}`,
-      `**Modalidad Legal Correspondiente:** **${modalidadLegal}**`,
-      `**Plazo Mínimo de Convocatoria Legal:** **${plazoMinimoDias} días hábiles** entre publicación y apertura.`,
-      "---",
-      `## 1. Valores de Garantías Legales`,
-      `- **Garantía de Seriedad de la Oferta (1%):** **${formatMonto(gSeriedad)}**`,
-      `  *Estado de exigencia:* ${requiereGarantiaSeriedad ? "⚠️ **MANDATORIA EN SOBRE A** (LPN / Comparación de Precios). Su omisión es causal de descalificación sin subsanación." : "Opcional / No exigida por ley en Compras Menores (salvo pliego específico)." }`,
-      `- **Garantía de Fiel Cumplimiento de Contrato (4% General):** **${formatMonto(gFielGen)}**`,
-      `- **Garantía de Fiel Cumplimiento Especial MIPYME (1% Dec. 416-23):** **${formatMonto(gFielMipyme)}** ${esMipyme ? "*(APLICA A TU EMPRESA: Ahorro directo en prima)*" : "*(Requiere certificación MICM vigente)*"}`,
-      `- **Anticipo Máximo Autorizado por Ley (20%):** **${formatMonto(anticipo)}**`,
+      `# Analisis normativo (Ley 47-25 / Dec. 52-26 / umbrales 2026)`,
+      `**Monto:** ${formatMonto(m)} | **Objeto:** ${tipo === "obras" ? "Obras" : "Bienes y servicios"}`,
+      `**Modalidad que corresponde:** ${legal.nombre}`,
+      legal.plazoMinimoDiasHabiles > 0
+        ? `**Plazo minimo entre convocatoria y recepcion de ofertas:** ${legal.plazoMinimoDiasHabiles} dias habiles (Art. 101 Ley 47-25).`
+        : `**Plazo minimo:** no aplica (Art. 101 parrafo).`,
+      legal.nota ? `_${legal.nota}_` : "",
+      "",
+      "## Umbrales 2026 aplicables (Resolucion PNP-03-2026)",
+      ...Object.entries(u).map(([k, v]) => `- ${k.replace(/_/g, " ").toLowerCase()}: ${formatMonto(v)}`),
+      "",
+      "## Garantias y anticipo",
+      `- Seriedad de oferta (1% de la oferta, Art. 202 Dec. 52-26): ${formatMonto(m * GARANTIAS.SERIEDAD_OFERTA_PCT)} sobre este monto.${p.es_mipyme ? " **Tu empresa es MIPYME: no se te puede exigir (Art. 175.2 Ley 47-25).**" : " Una MIPYME esta exenta (Art. 175.2 Ley 47-25)."} No aplica en sorteo de obras ni subasta inversa (Art. 201).`,
+      `- Fiel cumplimiento (Art. 207 Dec. 52-26): 4% = ${formatMonto(m * GARANTIAS.FIEL_CUMPLIMIENTO_PCT)}; MIPYME 1% = ${formatMonto(m * GARANTIAS.FIEL_CUMPLIMIENTO_MIPYME_PCT)}${p.es_mipyme ? " (aplica a tu empresa)" : ""}. Obligatoria por encima del equivalente a US$10,000 (Art. 205).`,
+      `- Anticipo MIPYME obligatorio 30% (Art. 174 Ley 47-25): ${formatMonto(m * GARANTIAS.ANTICIPO_MIPYME_PCT)}, con garantia de buen uso por el 100% del anticipo (Art. 210 Dec. 52-26).`,
+      `- MIPYMES: solo se les pueden exigir fianzas de aseguradoras (Art. 175.1 Ley 47-25).`,
     ];
-
-    // Validación de discrepancia o posible fraccionamiento
-    if (params.modalidad_planteada) {
-      out.push("", `## 2. Alerta de Legalidad e Impugnación`);
-      const modPlanteadaNorm = normalizar(params.modalidad_planteada);
-      const modLegalNorm = normalizar(modalidadLegal);
-
-      if (!modLegalNorm.includes(modPlanteadaNorm) && !modPlanteadaNorm.includes(modLegalNorm)) {
-        out.push(
-          `⚠️ **ALERTA PREVENTIVA DE DISCREPANCIA:**`,
-          `La institución convocó mediante *"${params.modalidad_planteada}"*, pero según los umbrales oficiales vigentes de la DGCP para **${formatMonto(m)}**, correspondería **"${modalidadLegal}"**.`,
-          `- Si la institución utilizó una modalidad de menor cuantía sin justificación de lote o urgencia, existe indicio pasible de **fraccionamiento** (Art. 25 Ley 340-06), sujeto a solicitud formal de aclaración o recurso administrativo.`,
-        );
+    if (p.modalidad_planteada) {
+      const inferior = modalidadInferiorALaLegal(p.modalidad_planteada, legal);
+      out.push("", "## Verificacion de la modalidad usada");
+      if (inferior === true) {
+        out.push(`ALERTA: "${p.modalidad_planteada}" es menos exigente que ${legal.nombre}, que es la que corresponde por monto. Indicio de fraccionamiento (Art. 81 Ley 47-25: dividir contrataciones de un mismo rubro en menos de 3 meses para eludir la modalidad). Puede pedirse aclaracion o interponer recurso de reconsideracion (Arts. 204-205).`);
+      } else if (inferior === false) {
+        out.push(`Conforme: "${p.modalidad_planteada}" es igual o mas exigente que la modalidad legal (Art. 59 P. II permite usar una superior).`);
       } else {
-        out.push(`✅ **Modalidad Conforme:** La modalidad convocada *"${params.modalidad_planteada}"* coincide con los umbrales oficiales vigentes de la DGCP.`);
+        out.push(`"${p.modalidad_planteada}" no es una modalidad ordinaria reconocible (p. ej. excepcion). Las excepciones requieren justificacion documentada y publicada.`);
+      }
+      if (claveModalidad(p.modalidad_planteada) === "licitacion_publica" && normalizar(p.modalidad_planteada).includes("abreviada")) {
+        out.push("Licitacion Publica Abreviada: solo para bienes y servicios comunes y estandarizados (Art. 62), minimo 15 dias habiles (Art. 101.2).");
       }
     }
-
-    out.push(
-      "",
-      `---`,
-      `### 📌 Fuentes Normativas y Trazabilidad Oficial:`,
-      `- **Resolución DGCP No. PNP-01-2024 / PNP-02-2024:** Fijación anual de umbrales para compras públicas.`,
-      `- **Ley No. 340-06 y modificatoria Ley No. 449-06:** Arts. 16, 17, 25, 30 y 31.`,
-      `- **Decreto No. 543-12:** Reglamento de Aplicación, Arts. 109, 112 y concordantes.`,
-      `- **Decreto No. 416-23:** Medidas de apoyo a MIPYMES (reducción de garantía de fiel cumplimiento al 1%).`,
-      ``,
-      `*Aviso de Responsabilidad Jurídica: Este análisis es una herramienta técnica orientativa automatizada basada en la normativa vigente al momento de la consulta. Requiere revisión humana por el equipo legal del oferente frente a las cláusulas particulares del Pliego de Condiciones Específicas.*`
-    );
-
-    return { content: [{ type: "text", text: out.join("\n") }] };
-  });
+    out.push("", `_${AVISO_LEGAL} Procesos convocados antes de la Ley 47-25 siguen la Ley 340-06 (Art. 245)._`);
+    return texto(out.filter((l) => l !== "").join("\n").replace(/\n(#+ )/g, "\n\n$1"));
+  }));
 }

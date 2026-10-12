@@ -1,14 +1,42 @@
 {
   "name": "dgcp-mcp-server",
-  "version": "4.1.0",
-  "description": "Servidor MCP Soberano para la API de Contrataciones Públicas de República Dominicana (DGCP v4.1)",
+  "version": "5.0.0",
+  "description": "Servidor MCP para la API de datos abiertos de Contrataciones Publicas de Republica Dominicana (DGCP): licitaciones en tiempo real, inteligencia de mercado y control legal bajo la Ley 47-25",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "dgcp",
+    "compras-publicas",
+    "contrataciones-publicas",
+    "republica-dominicana",
+    "licitaciones",
+    "datos-abiertos",
+    "ley-47-25"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/edwin042331-hue/dgcp-mcp-server.git"
+  },
   "main": "dist/index.js",
+  "bin": {
+    "dgcp-mcp-server": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "check": "npm run typecheck && npm test",
+    "smoke:live": "npm run build && node scripts/smoke-live.mjs",
     "inspect": "npx @modelcontextprotocol/inspector node ./dist/index.js",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "prepublishOnly": "npm run check && npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
@@ -20,6 +48,6 @@
     "vitest": "^5.0.1"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }
