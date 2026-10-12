@@ -1,31 +1,51 @@
-name: CI - Verificación de Integridad y Pruebas Unitarias
+name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+
+permissions:
+  contents: read
 
 jobs:
-  test-and-build:
-    name: Pruebas Vitest y Compilación TypeScript
+  verificar:
+    name: Node ${{ matrix.node }}
     runs-on: ubuntu-latest
-
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
     steps:
-      - name: Descargar Código Fuente (Checkout)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configurar Node.js (v20)
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'npm'
+          node-version: ${{ matrix.node }}
+          cache: npm
 
-      - name: Instalar Dependencias
+      - name: Instalar dependencias
         run: npm ci
 
-      - name: Ejecutar Pruebas Unitarias Automatizadas (Vitest)
+      - name: Verificar tipos
+        run: npm run typecheck
+
+      - name: Pruebas unitarias (sin red)
         run: npm test
 
-      - name: Compilar Proyecto (TypeScript)
+      - name: Compilar
         run: npm run build
+
+      - name: El servidor arranca y registra sus herramientas
+        run: |
+          node --input-type=module -e '
+            import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+            import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+            const c = new Client({ name: "ci", version: "1" });
+            await c.connect(new StdioClientTransport({ command: process.execPath, args: ["dist/index.js"] }));
+            const { tools } = await c.listTools();
+            console.log(`${tools.length} herramientas`);
+            await c.close();
+            if (tools.length !== 17) process.exit(1);
+          '
