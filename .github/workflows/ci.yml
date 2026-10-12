@@ -49,3 +49,17 @@ jobs:
             await c.close();
             if (tools.length !== 17) process.exit(1);
           '
+
+  # Check requerido por la proteccion de la rama main: resume la matriz completa.
+  requerido:
+    name: Pruebas Vitest y Compilación TypeScript
+    needs: verificar
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Todas las versiones de Node pasaron
+        run: |
+          if [ "${{ needs.verificar.result }}" != "success" ]; then
+            echo "La matriz termino con: ${{ needs.verificar.result }}"
+            exit 1
+          fi
